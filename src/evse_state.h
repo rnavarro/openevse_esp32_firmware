@@ -10,7 +10,8 @@ class EvseState
     enum Value : uint8_t {
       None,
       Active,
-      Disabled
+      Disabled,
+      Eco
     };
 
   EvseState() = default;
@@ -19,8 +20,10 @@ class EvseState
   bool fromString(const char *value)
   {
     // Cheat a bit and just check the first char
-    if('a' == value[0] || 'd' == value[0]) {
-      _value = 'a' == value[0] ? EvseState::Active : EvseState::Disabled;
+    if('a' == value[0] || 'd' == value[0] || 'e' == value[0]) {
+      _value = 'a' == value[0] ? EvseState::Active :
+               'e' == value[0] ? EvseState::Eco :
+               EvseState::Disabled;
       return true;
     }
     return false;
@@ -30,6 +33,7 @@ class EvseState
   {
     return EvseState::Active == _value ? "active" :
            EvseState::Disabled == _value ? "disabled" :
+           EvseState::Eco == _value ? "eco" :
            EvseState::None == _value ? "none" :
            "unknown";
   }
