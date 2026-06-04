@@ -479,6 +479,21 @@ After Phase 0, LwIP's `dns_servers[]` array is populated with both DHCPv4-suppli
 
 ### Phase 2: Mongoose HTTP Server — Dual-stack listening (socket path)
 
+**⚠️ TEMP PLATFORMIO HACK — MUST REVERT BEFORE ANY PR**
+
+platformio.ini has two coordinated changes that must be reverted together:
+
+1. `lib_deps` line 34: `jeremypoulter/ArduinoMongoose@0.0.22` is **commented out**
+2. `[env:olimex_esp32-gateway-f]`: `lib_extra_dirs = /home/rnavarro/workspace/ArduinoMongoose` points at the local fork on `fix/ipv6-dual-stack` branch
+
+**Revert steps before PR:**
+1. Publish `rnavarro/ArduinoMongoose` fork as a PlatformIO-usable package (or get upstream merge)
+2. Uncomment the `lib_deps` line, update version or change to fork URL
+3. Remove `lib_extra_dirs` from the Olimex env
+4. Verify ALL build envs (WiFi, Olimex, etc.) pull the IPv6-patched library
+
+**Current impact:** Only `olimex_esp32-gateway-f` has Phase 2 patches. All other envs (`openevse_wifi_v1`, etc.) still use stock 0.0.22 and will **not** listen on IPv6.
+
 **Goal:** Web UI and REST API accessible over both IPv4 and IPv6.
 
 **Changes in `rnavarro/ArduinoMongoose` (fork):**
