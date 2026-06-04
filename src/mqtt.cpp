@@ -109,23 +109,55 @@ unsigned long Mqtt::loop(MicroTasks::WakeReason reason) {
   }
 
 #if MG_ENABLE_IPV6
-  // Handle deferred IPv6 upgrade: if restart was requested while mid-connect,
-  // wait for the disconnect to complete before triggering a new attempt.
-  // This avoids racing the async teardown in Mongoose.
-  if (_pendingRestartForIPv6 && !_mqttclient.connected() && !_connecting) {
+  // Handle deferred IPv6 upgrade: if IPv6 arrived while mid-connect, the
+  // upgrade was deferred until the in-flight connection completed. Now
+  // that we're idle, proceed with the upgrade.
+  if (_pendingRestartForIPv6 && !_connecting) {
     _pendingRestartForIPv6 = false;
-    DBUGLN("MQTT: deferred IPv6 upgrade proceeding");
-    _nextMqttReconnectAttempt = 0; // Allow immediate reconnect
+    // Cancel if IPv6 was lost between the event and the deferred restart.
+    // A missing global address means the network changed and the upgrade
+    // would needlessly tear down a working IPv4 connection.
+    if (!net.hasGlobalIPv6()) {
+      DBUGLN("MQTT: deferred IPv6 upgrade cancelled — IPv6 no longer available");
+    } else if (_mqttclient.connected() && !isConnectedViaIPv6()) {
+      DBUGLN("MQTT: deferred IPv6 upgrade proceeding");
+      restartConnection();
+    } else if (!_mqttclient.connected()) {
+      DBUGLN("MQTT: deferred IPv6 upgrade — not connected, allowing immediate reconnect");
+      _nextMqttReconnectAttempt = 0;
+    }
   }
 
   // IPv6 global address transition: upgrade to IPv6 if currently on IPv4.
   // This is MQTT's own policy — net_manager fires the event, each service
   // decides what to do. Re-check hasGlobalIPv6() because the state may
   // have changed between trigger and this loop iteration.
+  //
+  // Handles three states:
+  //  - Connected over IPv4: teardown and reconnect with fresh AAAA-first resolve
+  //  - Mid-connect over IPv4: defer upgrade until current connect completes
+  //  - Disconnected: next reconnect attempt will do fresh resolve
   if (_ipv6GlobalListener.IsTriggered() && net.hasGlobalIPv6()
-      && isConnected() && !isConnectedViaIPv6()) {
-    DEBUG.printf("MQTT: upgrading connection to IPv6\r\n");
-    restartConnection();
+      && !isConnectedViaIPv6()) {
+    // Invalidate DNS cache so attemptConnection() does a fresh AAAA-first
+    // resolve instead of reusing the stale IPv4 cached result.
+    // Also reset IPv6 suppression — a fresh global address is a strong
+    // signal that the network changed and IPv6 deserves another chance.
+    _resolvedHost = "";
+    _resolvedAt = 0;
+    _resolvedIsIPv6 = false;
+    _ipv6FailCount = 0;
+    _ipv6SuppressedUntil = 0;
+    if (isConnected()) {
+      DEBUG.printf("MQTT: upgrading connection to IPv6\r\n");
+      restartConnection();
+    } else if (_connecting) {
+      DEBUG.printf("MQTT: deferring IPv6 upgrade until current connect completes\r\n");
+      _pendingRestartForIPv6 = true;
+    } else {
+      // Not connected and not connecting — next attempt will resolve fresh
+      _nextMqttReconnectAttempt = 0;
+    }
   }
 #endif
 
