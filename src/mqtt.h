@@ -34,6 +34,8 @@ class Mqtt : public MicroTasks::Task {
     unsigned long _nextMqttReconnectAttempt = 0;
     unsigned long _mqttRestartTime = 0;
     bool _connecting = false;
+    unsigned long _connectingSince = 0;  // millis() when _connecting became true
+    static constexpr unsigned long CONNECTING_TIMEOUT_MS = 30 * 1000; // 30s watchdog
     unsigned long _error_time = 0; // To handle disconnect events properly
 
 #if MG_ENABLE_IPV6

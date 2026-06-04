@@ -98,8 +98,8 @@ class NetManagerTask : public MicroTasks::Task
     NetState _state;
     String _ipaddress;
     String _macaddress;
-    String _ipv6address_linklocal;
-    String _ipv6address_global;
+    String _ipv6address_linklocal;  // Written in Arduino event task only (core 1)
+    String _ipv6address_global;       // Written in Arduino event task only (core 1)
 
     DNSServer _dnsServer;                  // Create class DNS server, captive portal re-direct
     bool _dnsServerStarted;

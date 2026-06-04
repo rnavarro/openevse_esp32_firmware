@@ -98,6 +98,16 @@ unsigned long Mqtt::loop(MicroTasks::WakeReason reason) {
     _nextMqttReconnectAttempt = 0; // Allow immediate reconnect after teardown
   }
 
+  // Watchdog: if _connecting has been true for too long, neither onConnect
+  // nor onError/onClose fired. Force-reset so the reconnect path can retry.
+  // This handles Mongoose bugs, network black holes, and half-closed states.
+  if (_connecting && (long)(millis() - _connectingSince) > (long)CONNECTING_TIMEOUT_MS) {
+    DEBUG.printf("MQTT: connecting watchdog expired after %lus, forcing reset\r\n",
+                (unsigned long)(CONNECTING_TIMEOUT_MS / 1000));
+    _connecting = false;
+    // Treat same as a disconnect — normal reconnect path will retry
+  }
+
 #if MG_ENABLE_IPV6
   // Handle deferred IPv6 upgrade: if restart was requested while mid-connect,
   // wait for the disconnect to complete before triggering a new attempt.
@@ -146,6 +156,7 @@ void Mqtt::attemptConnection() {
     return;
   }
   _connecting = true;
+  _connectingSince = millis();
   DBUGF("MQTT attempting connection... (%s)\n", net.isConnected() ? "connected" : "not connected");
 
   String mqtt_host = mqtt_server + ":" + String(mqtt_port);
@@ -215,6 +226,9 @@ void Mqtt::attemptConnection() {
       // LwIP default DNS timeout is ~14s with retries, worst case ~28s
       // for two sequential lookups. The cache mitigates this on reconnects.
       bool ipv6_suppressed = (now < _ipv6SuppressedUntil);
+      // Snapshot global IPv6 — local copy avoids cross-task String race
+      // (net_manager writes on Arduino event task, we read on MicroTasks loop,
+      //  both on core 1, so the window is tiny but we copy to be safe)
       String ipv6_global = net.getIpv6Global();
 
       if (ipv6_global.length() > 0 && !ipv6_suppressed) {
@@ -224,21 +238,24 @@ void Mqtt::attemptConnection() {
         hints.ai_family = AF_INET6;
         hints.ai_socktype = SOCK_STREAM;
         int rc = getaddrinfo(mqtt_server.c_str(), NULL, &hints, &result);
-        if (rc == 0 && result != NULL) {
-          struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)result->ai_addr;
-          // Verify this is a REAL IPv6 address, not IPv4-mapped (::ffff:x.x.x.x)
-          if (!ip6_addr_isipv4mappedipv6((ip6_addr_t *)&s6->sin6_addr)) {
+        if (rc == 0) {
+          // Iterate linked list for first real (non-IPv4-mapped) AAAA address.
+          // LwIP may return IPv4-mapped addresses for dual-stack hosts.
+          for (struct addrinfo *rp = result; rp != NULL && !resolved_ipv6; rp = rp->ai_next) {
+            if (rp->ai_family != AF_INET6 || rp->ai_addr == NULL) continue;
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)rp->ai_addr;
+            if (ip6_addr_isipv4mappedipv6((ip6_addr_t *)&s6->sin6_addr)) continue;
             char addrstr[INET6_ADDRSTRLEN];
             inet_ntop(AF_INET6, &s6->sin6_addr, addrstr, sizeof(addrstr));
             mqtt_host = "[" + String(addrstr) + "]:" + String(mqtt_port);
             DEBUG.printf("MQTT resolved %s -> IPv6 %s\r\n", mqtt_server.c_str(), addrstr);
             resolved_ipv6 = true;
-            // Cache the result
             _resolvedHost = String(addrstr);
             _resolvedIsIPv6 = true;
             _resolvedAt = now;
-          } else {
-            DEBUG.printf("MQTT: getaddrinfo(AF_INET6) returned IPv4-mapped for %s, ignoring\r\n", mqtt_server.c_str());
+          }
+          if (!resolved_ipv6) {
+            DEBUG.printf("MQTT: getaddrinfo(AF_INET6) returned only IPv4-mapped for %s\r\n", mqtt_server.c_str());
           }
           freeaddrinfo(result);
         }
