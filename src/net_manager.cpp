@@ -1,6 +1,9 @@
 #include "emonesp.h"
 #include "net_manager.h"
 #include "app_config.h"
+#include "lwip/netif.h"
+#include "esp_netif_net_stack.h"
+#include "mdns.h"
 #include "lcd.h"
 #include "espal.h"
 #include "time_man.h"
@@ -129,8 +132,8 @@ void NetManagerTask::wifiStartAccessPoint()
   _ipaddress = tmpStr;
   _macaddress = WiFi.macAddress();
 
-  DEBUG.printf("AP IP Address: %s\n", tmpStr);
-  DEBUG.printf("Channel: %d\n", WiFi.channel());
+  DEBUG.printf("AP IP Address: %s\r\n", tmpStr);
+  DEBUG.printf("Channel: %d\r\n", WiFi.channel());
 
   _lcd.display(softAP_ssid, 0, 0, 0, LCD_CLEAR_LINE);
   _lcd.display(String(F("Pass: ")) + _softAP_password, 0, 1, 15 * 1000, LCD_CLEAR_LINE);
@@ -201,8 +204,46 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
   _ipaddress = tmpStr;
   _macaddress = WiFi.macAddress();
 
-  DEBUG.print("Connected, IP: ");
-  DEBUG.println(tmpStr);
+  DEBUG.printf("Connected, IP: %s\r\n", tmpStr);
+
+  if (_ipv6address_global.length() > 0) {
+    DEBUG.printf("Connected, IPv6 global: %s\r\n", _ipv6address_global.c_str());
+  }
+  if (_ipv6address_linklocal.length() > 0) {
+    DEBUG.printf("Connected, IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
+  }
+
+  // Debug: print DNS servers (v4 and v6) from active netif
+  const char *netif_keys[] = {"WIFI_STA_DEF", "ETH_DEF"};
+  for (int n = 0; n < 2; n++) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(netif_keys[n]);
+    if (netif) {
+      esp_netif_dns_info_t dns;
+      for (int i = 0; i < 2; i++) {
+        if (esp_netif_get_dns_info(netif, (esp_netif_dns_type_t)i, &dns) == ESP_OK) {
+          if (dns.ip.type == ESP_IPADDR_TYPE_V4) {
+            DEBUG.printf("DNS%d (%s IPv4): " IPSTR "\r\n", i, netif_keys[n], IP2STR(&dns.ip.u_addr.ip4));
+          } else if (dns.ip.type == ESP_IPADDR_TYPE_V6) {
+            DEBUG.printf("DNS%d (%s IPv6): %s\r\n", i, netif_keys[n], IPv6Address(dns.ip.u_addr.ip6.addr).toString().c_str());
+          }
+        }
+      }
+    }
+  }
+
+  // Debug: print mDNS-registered addresses on ETH interface
+  esp_netif_t *eth_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+  if (eth_netif) {
+    esp_ip6_addr_t ip6_ll, ip6_gl;
+    if (esp_netif_get_ip6_linklocal(eth_netif, &ip6_ll) == ESP_OK) {
+      DEBUG.printf("mDNS debug: ETH link-local: %s\r\n", IPv6Address(ip6_ll.addr).toString().c_str());
+    }
+    if (esp_netif_get_ip6_global(eth_netif, &ip6_gl) == ESP_OK) {
+      DEBUG.printf("mDNS debug: ETH global: %s\r\n", IPv6Address(ip6_gl.addr).toString().c_str());
+    }
+  } else {
+    DEBUG.printf("mDNS debug: ETH_DEF netif not found\r\n");
+  }
 
   displayState();
 
@@ -437,10 +478,10 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
       if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
         _ipv6address_linklocal = IPv6Address(addr.addr).toString();
-        DBUGF("WiFi STA IPv6 link-local: %s", _ipv6address_linklocal.c_str());
+        DEBUG.printf("Connected, WiFi IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
       } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
         _ipv6address_global = IPv6Address(addr.addr).toString();
-        DBUGF("WiFi STA IPv6 global: %s", _ipv6address_global.c_str());
+        DEBUG.printf("Connected, WiFi IPv6 global: %s\r\n", _ipv6address_global.c_str());
       }
       Mongoose.ipConfigChanged();
     } break;
@@ -513,10 +554,63 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
       if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
         _ipv6address_linklocal = IPv6Address(addr.addr).toString();
-        DBUGF("ETH IPv6 link-local: %s", _ipv6address_linklocal.c_str());
+        DEBUG.printf("Connected, ETH IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
       } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
         _ipv6address_global = IPv6Address(addr.addr).toString();
-        DBUGF("ETH IPv6 global: %s", _ipv6address_global.c_str());
+        DEBUG.printf("Connected, ETH IPv6 global: %s\r\n", _ipv6address_global.c_str());
+
+        // Debug: verify ETH netif has global IPv6 after GOT_IP6
+        esp_netif_t *eth_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+        if (eth_netif) {
+          esp_ip6_addr_t ip6_gl;
+          if (esp_netif_get_ip6_global(eth_netif, &ip6_gl) == ESP_OK) {
+            DEBUG.printf("mDNS debug: ETH esp_netif_get_ip6_global after GOT_IP6: %s\r\n", IPv6Address(ip6_gl.addr).toString().c_str());
+          } else {
+            DEBUG.printf("mDNS debug: ETH esp_netif_get_ip6_global returned FAIL after GOT_IP6!\r\n");
+          }
+        }
+
+        // Workaround for ESP-IDF v4.4 libmdns.a AAAA bug:
+        // The precompiled mDNS library only calls esp_netif_get_ip6_linklocal()
+        // (reads ip6_addr slot 0) when building AAAA responses. It never calls
+        // esp_netif_get_ip6_global(). By swapping the global address into slot 0,
+        // mDNS will advertise the global address instead of the link-local.
+        esp_netif_t *swap_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+        if (swap_netif) {
+          struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
+          if (lwip_nif &&
+              ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[0])) &&
+              !ip6_addr_isany(ip_2_ip6(&lwip_nif->ip6_addr[1])) &&
+              !ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[1]))) {
+            ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
+            lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[1];
+            lwip_nif->ip6_addr[1] = tmp_addr;
+            u8_t tmp_state = lwip_nif->ip6_addr_state[0];
+            lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[1];
+            lwip_nif->ip6_addr_state[1] = tmp_state;
+            u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
+            lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[1];
+            lwip_nif->ip6_addr_valid_life[1] = tmp_valid;
+            u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
+            lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[1];
+            lwip_nif->ip6_addr_pref_life[1] = tmp_pref;
+            DBUGF("IPv6: swapped link-local (slot 0) with global (slot 1) for mDNS AAAA");
+          }
+        }
+
+        // Restart mDNS so it picks up the (now slot-0) global IPv6 address
+        DEBUG.printf("mDNS: restarting to advertise global IPv6\r\n");
+        mdns_free();
+        if (mdns_init() == ESP_OK && mdns_hostname_set(esp_hostname.c_str()) == ESP_OK) {
+          mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+          mdns_service_add(NULL, "_openevse", "_tcp", 80, NULL, 0);
+          mdns_service_txt_item_set("_openevse", "_tcp", "type", buildenv.c_str());
+          mdns_service_txt_item_set("_openevse", "_tcp", "version", currentfirmware.c_str());
+          mdns_service_txt_item_set("_openevse", "_tcp", "id", ESPAL.getLongId().c_str());
+          DEBUG.printf("mDNS: restarted with global IPv6\r\n");
+        } else {
+          DEBUG.printf("mDNS: restart FAILED\r\n");
+        }
       }
       Mongoose.ipConfigChanged();
     } break;
