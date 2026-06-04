@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <MicroTasks.h>
 #include <MicroTasksMessage.h>
+#include <MicroTasksEvent.h>
 
 #ifdef ESP32
 #include <WiFi.h>
@@ -97,6 +98,8 @@ class NetManagerTask : public MicroTasks::Task
     NetState _state;
     String _ipaddress;
     String _macaddress;
+    String _ipv6address_linklocal;  // Written in Arduino event task only (core 1)
+    String _ipv6address_global;       // Written in Arduino event task only (core 1)
 
     DNSServer _dnsServer;                  // Create class DNS server, captive portal re-direct
     bool _dnsServerStarted;
@@ -150,6 +153,16 @@ class NetManagerTask : public MicroTasks::Task
 
     void displayState();
     void haveNetworkConnection(IPAddress myAddress);
+    void onGlobalIPv6Acquired(const char *ifkey);
+    void onGlobalIPv6Lost();
+
+    // Public-fireable event for IPv6 global address transitions.
+    // MicroTasks::Event::Trigger() is protected, so we derive and expose it.
+    class IPv6GlobalEvent : public MicroTasks::Event {
+      public:
+        void Fire() { Trigger(); }
+    };
+    IPv6GlobalEvent _ipv6GlobalChanged;
 
     void wifiOnStationModeConnected(const WiFiEventStationModeConnected &event);
     void wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &event);
@@ -215,11 +228,74 @@ class NetManagerTask : public MicroTasks::Task
     String getIp() {
       return _ipaddress;
     }
+    String getIpv6Global() {
+      return _ipv6address_global;
+    }
+    String getIpv6LinkLocal() {
+      return _ipv6address_linklocal;
+    }
     String getMac() {
       return _macaddress;
+    }
+    bool hasGlobalIPv6() {
+      return _ipv6address_global.length() > 0;
+    }
+    void onIPv6GlobalChanged(MicroTasks::EventListener *listener) {
+      _ipv6GlobalChanged.Register(listener);
     }
 };
 
 extern NetManagerTask net;
+
+#if MG_ENABLE_IPV6
+/*
+ * Ensure IPv6 address literals in URLs are bracket-enclosed per RFC 3986.
+ * Handles two forms:
+ *   - Bare IPv6: "2001:db8::1" → "[2001:db8::1]"
+ *   - URL with unbracketed IPv6: "http://2001:db8::1/path" → "http://[2001:db8::1]/path"
+ * URLs that already have brackets or don't contain IPv6 literals are returned unchanged.
+ */
+static inline String ensureIpv6Brackets(const String &url) {
+  if (url.length() == 0) return url;
+
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd >= 0) {
+    // URL has a scheme (e.g. http://, wss://)
+    int hostStart = schemeEnd + 3;
+    if (hostStart < (int)url.length() && url.charAt(hostStart) == '[') {
+      return url;  // Already bracketed
+    }
+    // Find end of host (first '/' or ':' after host start)
+    int hostEnd = hostStart;
+    while (hostEnd < (int)url.length()) {
+      char c = url.charAt(hostEnd);
+      if (c == '/' || c == ':' || c == '?' || c == '#') break;
+      hostEnd++;
+    }
+    String host = url.substring(hostStart, hostEnd);
+    if (host.indexOf(':') >= 0) {
+      // Host contains colons = IPv6 literal. Wrap in brackets.
+      return url.substring(0, hostStart) + "[" + host + "]" + url.substring(hostEnd);
+    }
+  } else {
+    // No scheme — bare host or host:port
+    if (url.charAt(0) == '[') {
+      return url;  // Already bracketed
+    }
+    if (url.indexOf(':') >= 0) {
+      // IPv6 literal (possibly with :port). Check if it's host:port vs IPv6
+      // IPv6 has multiple colons; host:port has exactly one
+      int firstColon = url.indexOf(':');
+      int lastColon = url.lastIndexOf(':');
+      if (firstColon != lastColon) {
+        // Multiple colons = IPv6 literal without port
+        return "[" + url + "]";
+      }
+      // Single colon: could be host:port (not IPv6)
+    }
+  }
+  return url;
+}
+#endif // MG_ENABLE_IPV6
 
 #endif // _EMONESP_WIFI_H

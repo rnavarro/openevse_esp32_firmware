@@ -31,10 +31,36 @@ class Mqtt : public MicroTasks::Task {
     EvseManager *_evse; // Pointer to EvseManager instance
 
     // MQTT connection state and timing
-    long _nextMqttReconnectAttempt = 0;
+    unsigned long _nextMqttReconnectAttempt = 0;
     unsigned long _mqttRestartTime = 0;
     bool _connecting = false;
+    unsigned long _connectingSince = 0;  // millis() when _connecting became true
+    static constexpr unsigned long CONNECTING_TIMEOUT_MS = 30 * 1000; // 30s watchdog
     unsigned long _error_time = 0; // To handle disconnect events properly
+
+#if MG_ENABLE_IPV6
+    // IPv6 failure tracking: if IPv6 TCP connect fails repeatedly,
+    // suppress IPv6 resolution for a cooldown period to avoid
+    // getting pinned to a broken IPv6 path with no IPv4 fallback.
+    uint8_t _ipv6FailCount = 0;                  // Consecutive IPv6 connect failures
+    unsigned long _ipv6SuppressedUntil = 0;        // millis() timestamp: skip AAAA until this time
+    bool _lastAttemptWasIPv6 = false;              // Did the last attempt resolve to IPv6?
+    bool _connectedViaIPv6 = false;               // Is the current connection over IPv6?
+    static constexpr uint8_t IPV6_FAIL_THRESHOLD = 2;   // Failures before suppression
+    static constexpr unsigned long IPV6_SUPPRESS_MS = 10 * 60 * 1000; // 10 min cooldown
+
+    // DNS resolution cache: avoid blocking getaddrinfo() on every reconnect.
+    // Cached result is used if fresh (within TTL); re-resolved otherwise.
+    String _resolvedHost;                         // Resolved address string (IP literal)
+    bool _resolvedIsIPv6 = false;                 // Was the resolved address IPv6?
+    unsigned long _resolvedAt = 0;                 // millis() when resolved
+    static constexpr unsigned long DNS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min TTL
+    bool _pendingRestartForIPv6 = false;          // Delayed restart waiting for disconnect
+
+    // EventListener for IPv6 global address changes from net_manager.
+    // MQTT decides its own upgrade policy: only reconnect if currently on IPv4.
+    MicroTasks::EventListener _ipv6GlobalListener{this};
+#endif
 
     // Version tracking for publishing updates
     uint8_t _claimsVersion = 0;
@@ -79,6 +105,9 @@ class Mqtt : public MicroTasks::Task {
     // Public interface (existing functions from mqtt.h, adapted)
     bool isConnected();
     void restartConnection();
+#if MG_ENABLE_IPV6
+    bool isConnectedViaIPv6() { return _connectedViaIPv6; }
+#endif
 
     // Publishing methods - these can be called from other modules
     void publishData(JsonDocument &data); // Generic data publish

@@ -1,6 +1,9 @@
 #include "emonesp.h"
 #include "net_manager.h"
 #include "app_config.h"
+#include "lwip/netif.h"
+#include "esp_netif_net_stack.h"
+#include "mdns.h"
 #include "lcd.h"
 #include "espal.h"
 #include "time_man.h"
@@ -11,6 +14,7 @@
 #ifdef ESP32
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include <ESPmDNS.h>              // Resolve URL for update server etc.
 #elif defined(ESP8266)
 #include <ESP8266WiFi.h>
@@ -128,8 +132,8 @@ void NetManagerTask::wifiStartAccessPoint()
   _ipaddress = tmpStr;
   _macaddress = WiFi.macAddress();
 
-  DEBUG.printf("AP IP Address: %s\n", tmpStr);
-  DEBUG.printf("Channel: %d\n", WiFi.channel());
+  DEBUG.printf("AP IP Address: %s\r\n", tmpStr);
+  DEBUG.printf("Channel: %d\r\n", WiFi.channel());
 
   _lcd.display(softAP_ssid, 0, 0, 0, LCD_CLEAR_LINE);
   _lcd.display(String(F("Pass: ")) + _softAP_password, 0, 1, 15 * 1000, LCD_CLEAR_LINE);
@@ -171,6 +175,7 @@ void NetManagerTask::wifiClientConnect()
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(esid.c_str(), epass.c_str());
+  WiFi.enableIpV6();  // Request IPv6 on STA interface (v2.x API, uppercase V)
 
   _clientRetryTime = millis() + WIFI_CLIENT_RETRY_TIMEOUT;
 }
@@ -199,8 +204,46 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
   _ipaddress = tmpStr;
   _macaddress = WiFi.macAddress();
 
-  DEBUG.print("Connected, IP: ");
-  DEBUG.println(tmpStr);
+  DEBUG.printf("Connected, IP: %s\r\n", tmpStr);
+
+  if (_ipv6address_global.length() > 0) {
+    DEBUG.printf("Connected, IPv6 global: %s\r\n", _ipv6address_global.c_str());
+  }
+  if (_ipv6address_linklocal.length() > 0) {
+    DEBUG.printf("Connected, IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
+  }
+
+  // Debug: print DNS servers (v4 and v6) from active netif
+  const char *netif_keys[] = {"WIFI_STA_DEF", "ETH_DEF"};
+  for (int n = 0; n < 2; n++) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(netif_keys[n]);
+    if (netif) {
+      esp_netif_dns_info_t dns;
+      for (int i = 0; i < 2; i++) {
+        if (esp_netif_get_dns_info(netif, (esp_netif_dns_type_t)i, &dns) == ESP_OK) {
+          if (dns.ip.type == ESP_IPADDR_TYPE_V4) {
+            DEBUG.printf("DNS%d (%s IPv4): " IPSTR "\r\n", i, netif_keys[n], IP2STR(&dns.ip.u_addr.ip4));
+          } else if (dns.ip.type == ESP_IPADDR_TYPE_V6) {
+            DEBUG.printf("DNS%d (%s IPv6): %s\r\n", i, netif_keys[n], IPv6Address(dns.ip.u_addr.ip6.addr).toString().c_str());
+          }
+        }
+      }
+    }
+  }
+
+  // Debug: print mDNS-registered addresses on ETH interface
+  esp_netif_t *eth_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+  if (eth_netif) {
+    esp_ip6_addr_t ip6_ll, ip6_gl;
+    if (esp_netif_get_ip6_linklocal(eth_netif, &ip6_ll) == ESP_OK) {
+      DEBUG.printf("mDNS debug: ETH link-local: %s\r\n", IPv6Address(ip6_ll.addr).toString().c_str());
+    }
+    if (esp_netif_get_ip6_global(eth_netif, &ip6_gl) == ESP_OK) {
+      DEBUG.printf("mDNS debug: ETH global: %s\r\n", IPv6Address(ip6_gl.addr).toString().c_str());
+    }
+  } else {
+    DEBUG.printf("mDNS debug: ETH_DEF netif not found\r\n");
+  }
 
   displayState();
 
@@ -213,6 +256,76 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
   _apAutoApStopTime = millis() + ACCESS_POINT_AUTO_STOP_TIMEOUT;
 
   _state = NetState::Connected;
+}
+
+void NetManagerTask::onGlobalIPv6Acquired(const char *ifkey)
+{
+  // mDNS AAAA workaround: swap global address into LwIP slot 0 so
+  // the precompiled mDNS library (which only reads slot 0) advertises
+  // the global address instead of the link-local.
+  esp_netif_t *swap_netif = esp_netif_get_handle_from_ifkey(ifkey);
+  if (swap_netif) {
+    struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
+    if (lwip_nif &&
+        ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[0])) &&
+        !ip6_addr_isany(ip_2_ip6(&lwip_nif->ip6_addr[1])) &&
+        !ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[1]))) {
+      ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
+      lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[1];
+      lwip_nif->ip6_addr[1] = tmp_addr;
+      u8_t tmp_state = lwip_nif->ip6_addr_state[0];
+      lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[1];
+      lwip_nif->ip6_addr_state[1] = tmp_state;
+      u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
+      lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[1];
+      lwip_nif->ip6_addr_valid_life[1] = tmp_valid;
+      u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
+      lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[1];
+      lwip_nif->ip6_addr_pref_life[1] = tmp_pref;
+      DEBUG.printf("mDNS: swapped global IPv6 into slot 0 on %s\r\n", ifkey);
+    }
+  }
+
+  // Restart mDNS to pick up the swapped address
+  mdns_free();
+  if (mdns_init() == ESP_OK) {
+    mdns_hostname_set(esp_hostname.c_str());
+    mdns_instance_name_set(esp_hostname.c_str());
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    mdns_service_add(NULL, "_openevse", "_tcp", 80, NULL, 0);
+    mdns_service_txt_item_set("_openevse", "_tcp", "type", buildenv.c_str());
+    mdns_service_txt_item_set("_openevse", "_tcp", "version", currentfirmware.c_str());
+    mdns_service_txt_item_set("_openevse", "_tcp", "id", ESPAL.getLongId().c_str());
+    DEBUG.printf("mDNS: restarted with global IPv6\r\n");
+  } else {
+    DEBUG.printf("mDNS: restart FAILED\r\n");
+  }
+
+  // Notify subscribers (MQTT, OCPP, etc.) that global IPv6 is now available.
+  // Each service decides its own upgrade policy in its listener.
+  _ipv6GlobalChanged.Fire();
+
+  // Notify web UI and other event subscribers
+  StaticJsonDocument<128> doc;
+  doc["ipv6_global"] = _ipv6address_global;
+  doc["ipv6_event"] = "acquired";
+  event_send(doc);
+}
+
+void NetManagerTask::onGlobalIPv6Lost()
+{
+  bool had_global = _ipv6address_global.length() > 0;
+  _ipv6address_global = "";
+  _ipv6address_linklocal = "";
+
+  if (had_global) {
+    _ipv6GlobalChanged.Fire();
+
+    StaticJsonDocument<64> doc;
+    doc["ipv6_global"] = "";
+    doc["ipv6_event"] = "lost";
+    event_send(doc);
+  }
 }
 
 void NetManagerTask::wifiOnStationModeConnected(const WiFiEventStationModeConnected &event) {
@@ -237,6 +350,8 @@ void NetManagerTask::wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &eve
 
 void NetManagerTask::wifiOnStationModeDisconnected(const WiFiEventStationModeDisconnected &event)
 {
+  onGlobalIPv6Lost();
+
   DBUGF("WiFi dissconnected: %s",
     WIFI_DISCONNECT_REASON_UNSPECIFIED == event.reason ? "WIFI_DISCONNECT_REASON_UNSPECIFIED" :
     WIFI_DISCONNECT_REASON_AUTH_EXPIRE == event.reason ? "WIFI_DISCONNECT_REASON_AUTH_EXPIRE" :
@@ -399,6 +514,7 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       memcpy(dst.bssid, src.bssid, 6);
       dst.channel = src.channel;
       wifiOnStationModeConnected(dst);
+      WiFi.enableIpV6();  // Re-enable IPv6 after disconnect cleared it
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_STOP:
@@ -423,6 +539,24 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       dst.mask = src.netmask.addr;
       dst.gw = src.gw.addr;
       wifiOnStationModeGotIP(dst);
+    } break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+    {
+      esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
+      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
+      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
+        DEBUG.printf("Connected, WiFi IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
+      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        bool had_global = _ipv6address_global.length() > 0;
+        _ipv6address_global = IPv6Address(addr.addr).toString();
+        DEBUG.printf("Connected, WiFi IPv6 global: %s\r\n", _ipv6address_global.c_str());
+        if (!had_global) {
+          onGlobalIPv6Acquired("WIFI_STA_DEF");
+        }
+      }
+      Mongoose.ipConfigChanged();
     } break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -469,6 +603,7 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       break;
     case ARDUINO_EVENT_ETH_CONNECTED:
       DBUGLN("ETH Connected");
+      ETH.enableIpV6();  // Request IPv6 on ETH interface (v2.x API, uppercase V)
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
       DBUG("ETH MAC: ");
@@ -486,13 +621,32 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       _ethConnected = true;
       wifiStop();
       break;
+    case ARDUINO_EVENT_ETH_GOT_IP6:
+    {
+      esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
+      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
+      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
+        DEBUG.printf("Connected, ETH IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
+      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        bool had_global = _ipv6address_global.length() > 0;
+        _ipv6address_global = IPv6Address(addr.addr).toString();
+        DEBUG.printf("Connected, ETH IPv6 global: %s\r\n", _ipv6address_global.c_str());
+        if (!had_global) {
+          onGlobalIPv6Acquired("ETH_DEF");
+        }
+      }
+      Mongoose.ipConfigChanged();
+    } break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       DBUGLN("ETH Disconnected");
+      onGlobalIPv6Lost();
       _ethConnected = false;
       wifiStart();
       break;
     case ARDUINO_EVENT_ETH_STOP:
       DBUGLN("ETH Stopped");
+      onGlobalIPv6Lost();
       _ethConnected = false;
       break;
 #endif
