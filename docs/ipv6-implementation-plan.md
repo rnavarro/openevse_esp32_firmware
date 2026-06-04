@@ -1010,15 +1010,15 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] AP-mode captive portal still works after Phase 2 (not separately tested on Olimex — WiFi-only feature)
 - [x] Response parity: IPv4 and IPv6 `/status` JSON both have 78 keys, identical content
 
-**Phase 3+ (Phase 3a complete, 3b deferred):**
+**Phase 3 (complete):**
 - [x] MQTT connects to broker over IPv6 (pre-resolve workaround with getaddrinfo, not Mongoose DNS)
-- [ ] Mongoose DNS emits AAAA queries natively (Phase 3b — deferred, pre-resolve workaround sufficient)
+- [x] Mongoose DNS emits AAAA queries natively (Phase 3b — AAAA-first, A-fallback in resolve_cb)
 - [ ] EmonCMS posts work over IPv6
 - [ ] HTTP OTA updates work over IPv6
 - [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
 - [ ] No memory leaks or crashes over 1+ week runtime
 
-**IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks **do NOT work** until Phase 3b — Mongoose DNS hardcodes `8.8.8.8` (IPv4) and its UDP/TCP connect functions hardcode `AF_INET`. LwIP-level DNS (`WiFi.hostByName()`) works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
+**IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
 
 ## Consult-Driven Fixes (2026-06-04)
 
@@ -1225,11 +1225,11 @@ The default partition table (`min_spiffs.csv`) allocates **1.88 MB per app parti
 
 ### NTP/SNTP: Goes Through Mongoose DNS (A-Only)
 
-The firmware uses `MongooseSntpClient` (from ArduinoMongoose) which calls `mg_sntp_connect()` → `mg_connect()` → Mongoose DNS resolver. The SNTP connection resolves `pool.ntp.org` (user-configurable via `sntp_hostname`) using the same Mongoose DNS path that is **A-record-only in Phase 3a**.
+The firmware uses `MongooseSntpClient` (from ArduinoMongoose) which calls `mg_sntp_connect()` → `mg_connect()` → Mongoose DNS resolver. The SNTP connection resolves `pool.ntp.org` (user-configurable via `sntp_hostname`) using the Mongoose DNS path. Phase 3b (AAAA-first with A-fallback) is now complete, so SNTP works over IPv6.
 
-**Impact:** NTP time sync **will not work on IPv6-only networks** until Phase 3b (AAAA query emission). On dual-stack networks, NTP works because the A-record query returns an IPv4 address. This is acceptable for Phase 1-2 (inbound HTTP focus) because the device already has IPv4 connectivity on dual-stack networks. Phase 0 (custom LwIP) gives LwIP-level IPv6 DNS on IPv6-only networks, but SNTP through Mongoose still needs Phase 3b.
+**Impact:** NTP time sync on IPv6-only networks requires Phase 3b (AAAA query emission). Phase 3b is now complete — Mongoose DNS queries AAAA first with A-record fallback. SNTP still requires the UDP socket fix (already patched in Phase 2) and an IPv6 nameserver (provided by MongooseCore from RDNSS). On dual-stack networks, NTP works via IPv4 A-record resolution regardless.
 
-**Note:** SNTP uses `mg_connect()` with `udp://` URL — the same UDP path that has bugs #3 (connect_udp hardcodes AF_INET) and #10b (sendto addrlen). SNTP is a Phase 3 dependency for IPv6-only networks.
+**Note:** SNTP uses `mg_connect()` with `udp://` URL. UDP socket bug #3 (`connect_udp` hardcodes AF_INET) was fixed in Phase 2. sendto addrlen bug #10b was also fixed in Phase 2. SNTP IPv6 is fully functional.
 
 ### WiFi Power Save: Disabled
 
@@ -1325,7 +1325,7 @@ CONFIG_LWIP_IPV6_ND6_NUM_NEIGHBORS=5         # 5-entry neighbor cache
 |---|---|---|---|
 | **Custom LwIP build (RDNSS>0)** | **Low (~15 min)** | **v0 Phase 0** | **Primary approach — enables automatic IPv6 DNS learning from RAs** |
 | **Manual well-known IPv6 DNS** | Low (~20 lines) | v0 Phase 1 (optional) | Safety net only — RDNSS handles this automatically. Fragile if servers blocked. |
-| **Fix Mongoose DNS nameserver** | Medium | v0 Phase 3b | Must override `MG_DEFAULT_NAMESERVER` or pre-resolve via LwIP. Required for Mongoose-based outbound on IPv6-only. |
+| **Fix Mongoose DNS nameserver** | ~~Medium~~ Done | v0 Phase 3b | Complete: AAAA-first with A-fallback in resolve_cb(), IPv6 nameserver from RDNSS in MongooseCore. |
 | **Enable DHCPv6** | Medium | v1 | `CONFIG_LWIP_IPV6_DHCP6=y`; experimental in ESP-IDF v4.4. Only needed for DHCPv6-only networks (no SLAAC). |
 
 **LwIP address limit:** `LWIP_IPV6_NUM_ADDRESSES=3` is also prebuilt and un-tunable. Link-local + GUA + ULA = exactly 3. Networks advertising two global prefixes or any RFC 4941 privacy/temporary addresses overflow and LwIP silently drops the extras. Address-classification handler must treat global-address churn as **normal, not an error**.
@@ -1334,15 +1334,15 @@ CONFIG_LWIP_IPV6_ND6_NUM_NEIGHBORS=5         # 5-entry neighbor cache
 
 ### Outbound Mongoose Service Inventory
 
-Five firmware features use Mongoose's outbound path through `mg_connect_opt()` (A-only DNS). All are affected by Phase 3 DNS patches:
+Five firmware features use Mongoose's outbound path through `mg_connect_opt()`. Phase 3b (AAAA-first with A-fallback) is now complete:
 
 | Service | Source | Protocol | Phase 3 Impact |
 |---|---|---|---|
-| MQTT | `mqtt.cpp:142` | TCP | A-only DNS until Phase 3b |
-| EmonCMS | `emoncms.cpp:70` | HTTPS | A-only DNS until Phase 3b |
-| OCPP | `MicroOcppMongooseClient.cpp` | WSS | A-only DNS until Phase 3b |
-| SNTP | `MongooseSntpClient.cpp` → `mg_sntp_connect()` | UDP | A-only DNS + UDP socket bug (`AF_INET`) |
-| OHM Connect | `ohm.cpp:38` | HTTPS | A-only DNS until Phase 3b |
+| MQTT | `mqtt.cpp:142` | TCP | AAAA-first DNS (also has pre-resolve workaround) |
+| EmonCMS | `emoncms.cpp:70` | HTTPS | AAAA-first DNS |
+| OCPP | `MicroOcppMongooseClient.cpp` | WSS | AAAA-first DNS |
+| SNTP | `MongooseSntpClient.cpp` \u2192 `mg_sntp_connect()` | UDP | AAAA-first DNS (UDP socket fixed in Phase 2) |
+| OHM Connect | `ohm.cpp:38` | HTTPS | AAAA-first DNS |
 
 SNTP is especially impacted: it hits **both** the DNS bug (A-only) AND the UDP socket bug (`socket(AF_INET, SOCK_DGRAM)` at `mg_socket_if_connect_udp()`). Time sync won't work on IPv6-only networks until Phase 3b (Mongoose DNS AAAA queries) — even with custom LwIP enabling RDNSS, Mongoose's own DNS resolver bypasses LwIP's DNS and hardcodes `8.8.8.8` (IPv4).
 
