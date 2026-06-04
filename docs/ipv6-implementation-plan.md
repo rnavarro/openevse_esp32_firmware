@@ -1,8 +1,17 @@
 # IPv6 Support Implementation Plan
 
-**Date:** 2026-06-03 (updated with agent research findings)
+**Date:** 2026-06-03 (updated 2026-06-04 with consult findings)
 **Branch target:** `fix/ipv6-support` (from `master`)
 **Goal:** Enable dual-stack IPv4+IPv6 on OpenEVSE ESP32 firmware, test on local hardware, upstream if successful
+
+### Build Target Priority
+
+| Priority | Build Environment | Board | Notes |
+|---|---|---|---|
+| **P0 — Must test** | `openevse_wifi_v1` | ESP32 WROOM-32 | Both openevse-single (172.16.5.113) and openevse-double (172.16.5.187) run this buildenv |
+| **P1 — Must compile** | `openevse_wifi_tft_v1` | ESP32 WROOM-32 + TFT | Next most common variant; must not regress |
+| **P2 — Must compile** | `olimex_esp32-gateway-f` | Olimex ESP32-Gateway | ETH+WiFi; used for ETH code path testing during dev |
+| **P3 — Best effort** | All other 17 environments | Various | Compile check only, no runtime testing |
 
 ---
 
@@ -1001,14 +1010,85 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] AP-mode captive portal still works after Phase 2 (not separately tested on Olimex — WiFi-only feature)
 - [x] Response parity: IPv4 and IPv6 `/status` JSON both have 78 keys, identical content
 
-**Phase 3+ (not yet started):**
-- [ ] MQTT connects to broker over IPv6 (requires Phase 3b — AAAA query emission)
+**Phase 3+ (Phase 3a complete, 3b deferred):**
+- [x] MQTT connects to broker over IPv6 (pre-resolve workaround with getaddrinfo, not Mongoose DNS)
+- [ ] Mongoose DNS emits AAAA queries natively (Phase 3b — deferred, pre-resolve workaround sufficient)
 - [ ] EmonCMS posts work over IPv6
 - [ ] HTTP OTA updates work over IPv6
 - [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
 - [ ] No memory leaks or crashes over 1+ week runtime
 
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks **do NOT work** until Phase 3b — Mongoose DNS hardcodes `8.8.8.8` (IPv4) and its UDP/TCP connect functions hardcode `AF_INET`. LwIP-level DNS (`WiFi.hostByName()`) works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
+
+## Consult-Driven Fixes (2026-06-04)
+
+Three-model consult (GPT-5.5, Opus 4.8, Opus 4.6) reviewed the MQTT IPv6
+connection code and identified 8 issues (4 must-fix, 4 should-fix). All 8
+have been fixed and tested on Olimex hardware.
+
+### Must-Fix (all resolved)
+
+1. **IPv6 failure pins MQTT forever** — if IPv6 TCP connect fails but AAAA
+   resolves, MQTT retried IPv6 indefinitely with no IPv4 fallback. Fixed with
+   `_ipv6FailCount` / `_ipv6SuppressedUntil` tracking: after 2 consecutive
+   IPv6 connect failures, AAAA queries are suppressed for 10 minutes.
+   Resets on successful IPv6 connect.
+
+2. **WiFi STA missing MQTT restart** — `WIFI_STA_GOT_IP6` handler stored IPv6
+   but never triggered MQTT reconnect. Only ETH did. Fixed by adding
+   `onGlobalIPv6Acquired()` call in both WiFi and ETH handlers.
+
+3. **WiFi STA missing mDNS slot swap** — AAAA slot-swap workaround only ran
+   in `ETH_GOT_IP6`. Fixed by parameterizing `onGlobalIPv6Acquired(ifkey)`
+   with `"WIFI_STA_DEF"` / `"ETH_DEF"`.
+
+4. **MQTTS SNI breaks with IP literals** — pre-resolving to `[2603:...]:8883`
+   meant Mongoose never sent hostname for TLS SNI. Fixed by adding
+   `_tls_server_name` field and `setTlsServerName()` method to
+   `MongooseMqttClient`, which sets `opts.ssl_server_name` in
+   `mg_connect_opt()`.
+
+### Should-Fix (all resolved)
+
+5. **GOT_IP6 fires repeatedly** — SLAAC renewal, RA re-advertisement re-trigger
+   MQTT restart. Fixed with triple guard: (1) `!had_global` transition debounce
+   in net_manager, (2) MQTT's EventListener re-checks `net.hasGlobalIPv6()`,
+   (3) MQTT checks `!isConnectedViaIPv6()` so no restart when already on IPv6.
+
+6. **millis() signed/unsigned overflow** — `_nextMqttReconnectAttempt` was `long`,
+   `millis()` is `unsigned long`, comparison breaks at ~25 days. Fixed by
+   changing to `unsigned long` and using overflow-safe `(long)(now - ...)`.
+
+7. **Blocking getaddrinfo() in event loop** — two sequential synchronous DNS
+   lookups can stall for up to 28 seconds. Fixed with: (a) IP literal fast-path
+   that skips DNS when `mqtt_server` contains no alpha chars, (b) DNS cache with
+   5-min TTL that reuses resolved address across reconnects, invalidated on
+   IPv6 failure.
+
+8. **Restart-while-connecting race** — `restartConnection()` zeroed
+   `_connecting` and called `disconnect()` which is async. Fixed by removing
+   the `_connecting = false` from restart handler; async disconnect cascades
+   through `onClose` -> `onMqttDisconnect` which clears `_connecting`.
+   Added `_pendingRestartForIPv6` flag for deferred upgrades.
+
+### Architecture refactor: MicroTasks::Event decoupling
+
+All three consultants identified a layering violation: `net_manager.cpp`
+contained MQTT-specific policy (`mqtt.isConnected() &&
+!mqtt.isConnectedViaIPv6()`). The fix follows the existing
+`EvseMonitor::onStateChange` pattern in the codebase:
+
+- `NetManagerTask` owns debounce + fires `MicroTasks::Event` on IPv6 transitions
+- `onGlobalIPv6Acquired(ifkey)` centralizes mDNS slot swap, mDNS restart,
+  event notification, and event emission
+- `onGlobalIPv6Lost()` centralizes state clearing and event emission
+- `onIPv6GlobalChanged(EventListener*)` public registration method
+- `hasGlobalIPv6()` public query
+- MQTT owns its own upgrade policy via `_ipv6GlobalListener` in its `loop()`
+- `net_manager.cpp` no longer includes `mqtt.h`
+
+Any future service (OCPP, EmonCMS) subscribes with one line:
+`net.onIPv6GlobalChanged(&_myListener)`
 
 ## Test Results — Phase 0-2 (2026-06-04)
 

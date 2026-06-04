@@ -258,6 +258,76 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
   _state = NetState::Connected;
 }
 
+void NetManagerTask::onGlobalIPv6Acquired(const char *ifkey)
+{
+  // mDNS AAAA workaround: swap global address into LwIP slot 0 so
+  // the precompiled mDNS library (which only reads slot 0) advertises
+  // the global address instead of the link-local.
+  esp_netif_t *swap_netif = esp_netif_get_handle_from_ifkey(ifkey);
+  if (swap_netif) {
+    struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
+    if (lwip_nif &&
+        ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[0])) &&
+        !ip6_addr_isany(ip_2_ip6(&lwip_nif->ip6_addr[1])) &&
+        !ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[1]))) {
+      ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
+      lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[1];
+      lwip_nif->ip6_addr[1] = tmp_addr;
+      u8_t tmp_state = lwip_nif->ip6_addr_state[0];
+      lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[1];
+      lwip_nif->ip6_addr_state[1] = tmp_state;
+      u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
+      lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[1];
+      lwip_nif->ip6_addr_valid_life[1] = tmp_valid;
+      u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
+      lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[1];
+      lwip_nif->ip6_addr_pref_life[1] = tmp_pref;
+      DEBUG.printf("mDNS: swapped global IPv6 into slot 0 on %s\r\n", ifkey);
+    }
+  }
+
+  // Restart mDNS to pick up the swapped address
+  mdns_free();
+  if (mdns_init() == ESP_OK) {
+    mdns_hostname_set(esp_hostname.c_str());
+    mdns_instance_name_set(esp_hostname.c_str());
+    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    mdns_service_add(NULL, "_openevse", "_tcp", 80, NULL, 0);
+    mdns_service_txt_item_set("_openevse", "_tcp", "type", buildenv.c_str());
+    mdns_service_txt_item_set("_openevse", "_tcp", "version", currentfirmware.c_str());
+    mdns_service_txt_item_set("_openevse", "_tcp", "id", ESPAL.getLongId().c_str());
+    DEBUG.printf("mDNS: restarted with global IPv6\r\n");
+  } else {
+    DEBUG.printf("mDNS: restart FAILED\r\n");
+  }
+
+  // Notify subscribers (MQTT, OCPP, etc.) that global IPv6 is now available.
+  // Each service decides its own upgrade policy in its listener.
+  _ipv6GlobalChanged.Fire();
+
+  // Notify web UI and other event subscribers
+  StaticJsonDocument<128> doc;
+  doc["ipv6_global"] = _ipv6address_global;
+  doc["ipv6_event"] = "acquired";
+  event_send(doc);
+}
+
+void NetManagerTask::onGlobalIPv6Lost()
+{
+  bool had_global = _ipv6address_global.length() > 0;
+  _ipv6address_global = "";
+  _ipv6address_linklocal = "";
+
+  if (had_global) {
+    _ipv6GlobalChanged.Fire();
+
+    StaticJsonDocument<64> doc;
+    doc["ipv6_global"] = "";
+    doc["ipv6_event"] = "lost";
+    event_send(doc);
+  }
+}
+
 void NetManagerTask::wifiOnStationModeConnected(const WiFiEventStationModeConnected &event) {
   DBUGF("Connected to %s", event.ssid.c_str());
 }
@@ -280,8 +350,7 @@ void NetManagerTask::wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &eve
 
 void NetManagerTask::wifiOnStationModeDisconnected(const WiFiEventStationModeDisconnected &event)
 {
-  _ipv6address_global = "";
-  _ipv6address_linklocal = "";
+  onGlobalIPv6Lost();
 
   DBUGF("WiFi dissconnected: %s",
     WIFI_DISCONNECT_REASON_UNSPECIFIED == event.reason ? "WIFI_DISCONNECT_REASON_UNSPECIFIED" :
@@ -480,8 +549,12 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
         _ipv6address_linklocal = IPv6Address(addr.addr).toString();
         DEBUG.printf("Connected, WiFi IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
       } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        bool had_global = _ipv6address_global.length() > 0;
         _ipv6address_global = IPv6Address(addr.addr).toString();
         DEBUG.printf("Connected, WiFi IPv6 global: %s\r\n", _ipv6address_global.c_str());
+        if (!had_global) {
+          onGlobalIPv6Acquired("WIFI_STA_DEF");
+        }
       }
       Mongoose.ipConfigChanged();
     } break;
@@ -556,71 +629,24 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
         _ipv6address_linklocal = IPv6Address(addr.addr).toString();
         DEBUG.printf("Connected, ETH IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
       } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        bool had_global = _ipv6address_global.length() > 0;
         _ipv6address_global = IPv6Address(addr.addr).toString();
         DEBUG.printf("Connected, ETH IPv6 global: %s\r\n", _ipv6address_global.c_str());
-
-        // Debug: verify ETH netif has global IPv6 after GOT_IP6
-        esp_netif_t *eth_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
-        if (eth_netif) {
-          esp_ip6_addr_t ip6_gl;
-          if (esp_netif_get_ip6_global(eth_netif, &ip6_gl) == ESP_OK) {
-            DEBUG.printf("mDNS debug: ETH esp_netif_get_ip6_global after GOT_IP6: %s\r\n", IPv6Address(ip6_gl.addr).toString().c_str());
-          } else {
-            DEBUG.printf("mDNS debug: ETH esp_netif_get_ip6_global returned FAIL after GOT_IP6!\r\n");
-          }
-        }
-
-        // Workaround for ESP-IDF v4.4 libmdns.a AAAA bug:
-        // The precompiled mDNS library only calls esp_netif_get_ip6_linklocal()
-        // (reads ip6_addr slot 0) when building AAAA responses. It never calls
-        // esp_netif_get_ip6_global(). By swapping the global address into slot 0,
-        // mDNS will advertise the global address instead of the link-local.
-        esp_netif_t *swap_netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
-        if (swap_netif) {
-          struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
-          if (lwip_nif &&
-              ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[0])) &&
-              !ip6_addr_isany(ip_2_ip6(&lwip_nif->ip6_addr[1])) &&
-              !ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[1]))) {
-            ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
-            lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[1];
-            lwip_nif->ip6_addr[1] = tmp_addr;
-            u8_t tmp_state = lwip_nif->ip6_addr_state[0];
-            lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[1];
-            lwip_nif->ip6_addr_state[1] = tmp_state;
-            u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
-            lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[1];
-            lwip_nif->ip6_addr_valid_life[1] = tmp_valid;
-            u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
-            lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[1];
-            lwip_nif->ip6_addr_pref_life[1] = tmp_pref;
-            DBUGF("IPv6: swapped link-local (slot 0) with global (slot 1) for mDNS AAAA");
-          }
-        }
-
-        // Restart mDNS so it picks up the (now slot-0) global IPv6 address
-        DEBUG.printf("mDNS: restarting to advertise global IPv6\r\n");
-        mdns_free();
-        if (mdns_init() == ESP_OK && mdns_hostname_set(esp_hostname.c_str()) == ESP_OK) {
-          mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-          mdns_service_add(NULL, "_openevse", "_tcp", 80, NULL, 0);
-          mdns_service_txt_item_set("_openevse", "_tcp", "type", buildenv.c_str());
-          mdns_service_txt_item_set("_openevse", "_tcp", "version", currentfirmware.c_str());
-          mdns_service_txt_item_set("_openevse", "_tcp", "id", ESPAL.getLongId().c_str());
-          DEBUG.printf("mDNS: restarted with global IPv6\r\n");
-        } else {
-          DEBUG.printf("mDNS: restart FAILED\r\n");
+        if (!had_global) {
+          onGlobalIPv6Acquired("ETH_DEF");
         }
       }
       Mongoose.ipConfigChanged();
     } break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       DBUGLN("ETH Disconnected");
+      onGlobalIPv6Lost();
       _ethConnected = false;
       wifiStart();
       break;
     case ARDUINO_EVENT_ETH_STOP:
       DBUGLN("ETH Stopped");
+      onGlobalIPv6Lost();
       _ethConnected = false;
       break;
 #endif

@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <MicroTasks.h>
 #include <MicroTasksMessage.h>
+#include <MicroTasksEvent.h>
 
 #ifdef ESP32
 #include <WiFi.h>
@@ -152,6 +153,16 @@ class NetManagerTask : public MicroTasks::Task
 
     void displayState();
     void haveNetworkConnection(IPAddress myAddress);
+    void onGlobalIPv6Acquired(const char *ifkey);
+    void onGlobalIPv6Lost();
+
+    // Public-fireable event for IPv6 global address transitions.
+    // MicroTasks::Event::Trigger() is protected, so we derive and expose it.
+    class IPv6GlobalEvent : public MicroTasks::Event {
+      public:
+        void Fire() { Trigger(); }
+    };
+    IPv6GlobalEvent _ipv6GlobalChanged;
 
     void wifiOnStationModeConnected(const WiFiEventStationModeConnected &event);
     void wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &event);
@@ -225,6 +236,12 @@ class NetManagerTask : public MicroTasks::Task
     }
     String getMac() {
       return _macaddress;
+    }
+    bool hasGlobalIPv6() {
+      return _ipv6address_global.length() > 0;
+    }
+    void onIPv6GlobalChanged(MicroTasks::EventListener *listener) {
+      _ipv6GlobalChanged.Register(listener);
     }
 };
 
