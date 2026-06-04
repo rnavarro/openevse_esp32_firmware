@@ -11,6 +11,7 @@
 #ifdef ESP32
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include <ESPmDNS.h>              // Resolve URL for update server etc.
 #elif defined(ESP8266)
 #include <ESP8266WiFi.h>
@@ -171,6 +172,7 @@ void NetManagerTask::wifiClientConnect()
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(esid.c_str(), epass.c_str());
+  WiFi.enableIpV6();  // Request IPv6 on STA interface (v2.x API, uppercase V)
 
   _clientRetryTime = millis() + WIFI_CLIENT_RETRY_TIMEOUT;
 }
@@ -237,6 +239,9 @@ void NetManagerTask::wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &eve
 
 void NetManagerTask::wifiOnStationModeDisconnected(const WiFiEventStationModeDisconnected &event)
 {
+  _ipv6address_global = "";
+  _ipv6address_linklocal = "";
+
   DBUGF("WiFi dissconnected: %s",
     WIFI_DISCONNECT_REASON_UNSPECIFIED == event.reason ? "WIFI_DISCONNECT_REASON_UNSPECIFIED" :
     WIFI_DISCONNECT_REASON_AUTH_EXPIRE == event.reason ? "WIFI_DISCONNECT_REASON_AUTH_EXPIRE" :
@@ -399,6 +404,7 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       memcpy(dst.bssid, src.bssid, 6);
       dst.channel = src.channel;
       wifiOnStationModeConnected(dst);
+      WiFi.enableIpV6();  // Re-enable IPv6 after disconnect cleared it
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_STOP:
@@ -423,6 +429,20 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       dst.mask = src.netmask.addr;
       dst.gw = src.gw.addr;
       wifiOnStationModeGotIP(dst);
+    } break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+    {
+      esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
+      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
+      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
+        DBUGF("WiFi STA IPv6 link-local: %s", _ipv6address_linklocal.c_str());
+      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        _ipv6address_global = IPv6Address(addr.addr).toString();
+        DBUGF("WiFi STA IPv6 global: %s", _ipv6address_global.c_str());
+      }
+      Mongoose.ipConfigChanged();
     } break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -469,6 +489,7 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       break;
     case ARDUINO_EVENT_ETH_CONNECTED:
       DBUGLN("ETH Connected");
+      ETH.enableIpV6();  // Request IPv6 on ETH interface (v2.x API, uppercase V)
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
       DBUG("ETH MAC: ");
@@ -486,6 +507,19 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       _ethConnected = true;
       wifiStop();
       break;
+    case ARDUINO_EVENT_ETH_GOT_IP6:
+    {
+      esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
+      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
+      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
+        DBUGF("ETH IPv6 link-local: %s", _ipv6address_linklocal.c_str());
+      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+        _ipv6address_global = IPv6Address(addr.addr).toString();
+        DBUGF("ETH IPv6 global: %s", _ipv6address_global.c_str());
+      }
+      Mongoose.ipConfigChanged();
+    } break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       DBUGLN("ETH Disconnected");
       _ethConnected = false;

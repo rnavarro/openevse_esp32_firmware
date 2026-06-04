@@ -97,6 +97,8 @@ class NetManagerTask : public MicroTasks::Task
     NetState _state;
     String _ipaddress;
     String _macaddress;
+    String _ipv6address_linklocal;
+    String _ipv6address_global;
 
     DNSServer _dnsServer;                  // Create class DNS server, captive portal re-direct
     bool _dnsServerStarted;
@@ -214,6 +216,12 @@ class NetManagerTask : public MicroTasks::Task
 
     String getIp() {
       return _ipaddress;
+    }
+    String getIpv6Global() {
+      return _ipv6address_global;
+    }
+    String getIpv6LinkLocal() {
+      return _ipv6address_linklocal;
     }
     String getMac() {
       return _macaddress;
