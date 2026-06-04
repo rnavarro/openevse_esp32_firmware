@@ -247,4 +247,55 @@ class NetManagerTask : public MicroTasks::Task
 
 extern NetManagerTask net;
 
+#if MG_ENABLE_IPV6
+/*
+ * Ensure IPv6 address literals in URLs are bracket-enclosed per RFC 3986.
+ * Handles two forms:
+ *   - Bare IPv6: "2001:db8::1" → "[2001:db8::1]"
+ *   - URL with unbracketed IPv6: "http://2001:db8::1/path" → "http://[2001:db8::1]/path"
+ * URLs that already have brackets or don't contain IPv6 literals are returned unchanged.
+ */
+static inline String ensureIpv6Brackets(const String &url) {
+  if (url.length() == 0) return url;
+
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd >= 0) {
+    // URL has a scheme (e.g. http://, wss://)
+    int hostStart = schemeEnd + 3;
+    if (hostStart < (int)url.length() && url.charAt(hostStart) == '[') {
+      return url;  // Already bracketed
+    }
+    // Find end of host (first '/' or ':' after host start)
+    int hostEnd = hostStart;
+    while (hostEnd < (int)url.length()) {
+      char c = url.charAt(hostEnd);
+      if (c == '/' || c == ':' || c == '?' || c == '#') break;
+      hostEnd++;
+    }
+    String host = url.substring(hostStart, hostEnd);
+    if (host.indexOf(':') >= 0) {
+      // Host contains colons = IPv6 literal. Wrap in brackets.
+      return url.substring(0, hostStart) + "[" + host + "]" + url.substring(hostEnd);
+    }
+  } else {
+    // No scheme — bare host or host:port
+    if (url.charAt(0) == '[') {
+      return url;  // Already bracketed
+    }
+    if (url.indexOf(':') >= 0) {
+      // IPv6 literal (possibly with :port). Check if it's host:port vs IPv6
+      // IPv6 has multiple colons; host:port has exactly one
+      int firstColon = url.indexOf(':');
+      int lastColon = url.lastIndexOf(':');
+      if (firstColon != lastColon) {
+        // Multiple colons = IPv6 literal without port
+        return "[" + url + "]";
+      }
+      // Single colon: could be host:port (not IPv6)
+    }
+  }
+  return url;
+}
+#endif // MG_ENABLE_IPV6
+
 #endif // _EMONESP_WIFI_H

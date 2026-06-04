@@ -1010,13 +1010,39 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] AP-mode captive portal still works after Phase 2 (not separately tested on Olimex — WiFi-only feature)
 - [x] Response parity: IPv4 and IPv6 `/status` JSON both have 78 keys, identical content
 
-**Phase 3 (complete):**
+**Phase 3 (complete — AAAA-first DNS in Mongoose + MQTT pre-resolve hardening):**
 - [x] MQTT connects to broker over IPv6 (pre-resolve workaround with getaddrinfo, not Mongoose DNS)
 - [x] Mongoose DNS emits AAAA queries natively (Phase 3b — AAAA-first, A-fallback in resolve_cb)
+- [x] IPv6 failure cooldown (2 consecutive failures → 10-min AAAA suppression, IPv4 fallback)
+- [x] MQTT SNI preserved over IP literals via setTlsServerName()
+- [x] DNS cache with 5-min TTL + IP literal fast-path
+- [x] 30s connecting watchdog
+- [x] net_manager decoupled from mqtt.h (MicroTasks::Event)
+- [x] GOT_IP6 triple guard debounce (transition + re-check + family check)
+- [x] WiFi STA mDNS AAAA slot swap parity with ETH
+- [x] millis() unsigned long overflow-safe comparison
+
+**Phase 4 (Application Layer — Full Integration):**
+- [x] MQTT config accepts IPv6 broker addresses in `[bracket]:port` format (since Phase 3)
+- [x] EmonCMS server URLs with IPv6 literals auto-bracketed via `ensureIpv6Brackets()`
+- [x] OCPP server URLs with IPv6 literals auto-bracketed via `ensureIpv6Brackets()`
+- [x] HTTP OTA — uses file upload, not URL-based (no change needed)
+- [x] Web UI displays `ipv6address_global` and `ipv6address_linklocal` on Network page
+- [x] Captive portal IPv4-only in v0 (confirmed no v0/v2 blockers)
+- [ ] *Hardware verification: test entering IPv6 addresses in MQTT/EmonCMS/OCPP config fields*
+- [ ] *Hardware verification: confirm Network page shows IPv6 addresses*
+- [ ] *Hardware verification: confirm AP mode captive portal still works*
+
+**Phase 5 (Hardening and Testing):**
+- [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
 - [ ] EmonCMS posts work over IPv6
 - [ ] HTTP OTA updates work over IPv6
-- [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
 - [ ] No memory leaks or crashes over 1+ week runtime
+- [ ] IPv4-mapped addresses display as `a.b.c.d` not `::ffff:a.b.c.d` in debug logs
+- [ ] IPv6-only network test: disable IPv4, verify EVSE still functions
+- [ ] Address change resilience: verify firmware handles IPv6 address churn gracefully
+- [ ] Memory impact: measure heap usage with IPv6 enabled
+- [ ] Flash impact: firmware still fits in 16MB partition
 
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
 

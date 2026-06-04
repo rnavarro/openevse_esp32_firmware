@@ -13,6 +13,7 @@
 #include "app_config.h"
 #include "http_update.h"
 #include "emonesp.h"
+#include "net_manager.h"
 #include "certificates.h"
 
 // Time between loop polls
@@ -82,7 +83,19 @@ public:
     }
 
     const char *getString() override { //always returns c-string (empty if undefined)
-        return configString && configString->c_str() ? configString->c_str() : "";
+        if (!configString || !configString->c_str()) return "";
+#if MG_ENABLE_IPV6
+        // Ensure IPv6 literals in URLs are bracket-enclosed for Mongoose URL parsing
+        // Cache the corrected string since we must return const char*
+        if (strcmp(keyOcpp, MO_CONFIG_EXT_PREFIX "BackendUrl") == 0 ||
+            strcmp(keyOpenEvse, "ocpp_server") == 0) {
+            String corrected = ensureIpv6Brackets(*configString);
+            if (corrected != *configString) {
+                *configString = corrected;
+            }
+        }
+#endif
+        return configString->c_str();
     }
 
     MicroOcpp::TConfig getType() override {

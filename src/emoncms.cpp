@@ -12,6 +12,7 @@
 #include "app_config.h"
 #include "input.h"
 #include "event.h"
+#include "net_manager.h"
 
 boolean emoncms_connected = false;
 boolean emoncms_updated = false;
@@ -48,7 +49,7 @@ void emoncms_publish(JsonDocument &data)
 
   if (config_emoncms_enabled() && emoncms_apikey != 0)
   {
-    String url = emoncms_server + post_path;
+    String url = ensureIpv6Brackets(emoncms_server) + post_path;
     String json;
     serializeJson(data, json);
     url += "fulljson=";
