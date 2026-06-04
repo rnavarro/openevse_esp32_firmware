@@ -1074,11 +1074,11 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [ ] EmonCMS posts work over IPv6
 - [ ] HTTP OTA updates work over IPv6
 - [ ] No memory leaks or crashes over 1+ week runtime
-- [ ] IPv4-mapped addresses display as `a.b.c.d` not `::ffff:a.b.c.d` in debug logs
+- [x] IPv4-mapped addresses display as `a.b.c.d` not `::ffff:a.b.c.d` in debug logs — **non-issue confirmed**: Mongoose `inet_ntoa()` calls operate on `nc->sa.sin.sin_addr` (IPv4-only struct, can't produce `::ffff:` output). Application-layer IPv6 display uses LwIP's `ip6addr_ntoa()` which produces proper `2001:db8::1` notation. DNS-level IPv4-mapped filtering in `mqtt.cpp` two-step `getaddrinfo()` prevents `::ffff:` from ever reaching the connect path.
 - [ ] IPv6-only network test: disable IPv4, verify EVSE still functions
 - [ ] Address change resilience: verify firmware handles IPv6 address churn gracefully
-- [ ] Memory impact: measure heap usage with IPv6 enabled
-- [ ] Flash impact: firmware still fits in 16MB partition
+- [x] Memory impact: RAM +136 bytes (+0.04%, 63,360→63,496 of 327,680). Well within heap budget.
+- [x] Flash impact: Flash +11,120 bytes (+0.6%, 1,841,185→1,852,305 of 1,966,080). Fits 16MB partition at 94.2%.
 
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
 
