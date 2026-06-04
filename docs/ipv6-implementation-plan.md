@@ -1033,6 +1033,42 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [ ] *Hardware verification: confirm Network page shows IPv6 addresses*
 - [ ] *Hardware verification: confirm AP mode captive portal still works*
 
+**GUI Fork & Submodule Setup (completed):**
+
+- The firmware build uses the **submodule** at `openevse_esp32_firmware/gui-v2` (not the
+  standalone clone at `~/workspace/openevse-gui-v2`). Confirmed via `scripts/extra_script.py`
+  line 188: `gui_dir = join(PROJECT_DIR, "gui-v2")`.
+
+- Forked `OpenEVSE/openevse-gui-v2` → `rnavarro/openevse-gui-v2` on GitHub.
+
+- **Standalone clone** (`~/workspace/openevse-gui-v2`) reconfigured:
+  - `origin` → `git@github.com:rnavarro/openevse-gui-v2.git`
+  - `upstream` → `https://github.com/OpenEVSE/openevse-gui-v2.git`
+  - Local `integration` branch (not pushed) merges both fix branches for convenience
+  - `master` stays clean mirror of upstream
+
+- **Submodule** (`openevse_esp32_firmware/gui-v2`) reconfigured:
+  - `.gitmodules` URL updated to `git@github.com:rnavarro/openevse-gui-v2.git`
+  - `origin` → `git@github.com:rnavarro/openevse-gui-v2.git`
+  - `upstream` → `https://github.com/OpenEVSE/openevse-gui-v2.git`
+  - Checked out on local `integration` branch (both patches merged)
+
+- **Fix branches on fork** (both pushed):
+  - `fix/eco-timer-scheduling` — Eco state option in timer scheduling (8 files)
+  - `fix/ipv6-network-page` — Display IPv6 addresses on Network config page (1 file)
+
+- **Non-breaking guarantee:** Both patches are purely additive. The IPv6 display uses
+  `{#if}` conditionals — if the firmware doesn't send `ipv6address_global` or
+  `ipv6address_linklocal` in the `/status` JSON, the blocks simply don't render.
+  The eco timer change adds a new scheduler dropdown option with no effect on existing
+  functionality. Either patch can be upstreamed independently without breaking upstream
+  firmware.
+
+- **Upstreaming flow:** GUI-v2 is a submodule dependency of the main repo. Changes must
+  be pushed to the fork first, then the main repo updates its submodule reference. When
+  upstreaming, each fix branch goes as a separate PR to `OpenEVSE/openevse-gui-v2`.
+  `integration` is ephemeral and local-only — never pushed.
+
 **Phase 5 (Hardening and Testing):**
 - [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
 - [ ] EmonCMS posts work over IPv6

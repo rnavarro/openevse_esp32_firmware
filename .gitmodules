@@ -1,4 +1,4 @@
 [submodule "gui-v2"]
 	path = gui-v2
-	url = https://github.com/OpenEVSE/openevse-gui-v2
+	url = git@github.com:rnavarro/openevse-gui-v2.git
 	branch = master
