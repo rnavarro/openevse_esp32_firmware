@@ -1164,6 +1164,59 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
 
+## Testing Gaps from IoTaWatt Cross-Review (2026-06-04)
+
+The parallel IoTaWatt ESP8266 IPv6 effort (`~/workspace/IoTaWatt/ai_notes/ipv6_implementation_plan.md`)
+went deeper on outbound-path testing and surfaced failure modes our plan hadn't covered. Their
+HE-lite fallback looked correct on paper and failed twice on hardware before instrumentation
+found the real bug — paper analysis of fallback paths is not sufficient. Gaps identified by
+comparing their proven coverage against ours:
+
+- [ ] **GAP 1 — MQTT trap test (highest priority).** The helite blackhole-AAAA test only
+  exercised the Mongoose/EmonCMS path and the mongoose.c cooldown cache. MQTT has a
+  completely separate resolve + suppression mechanism (two-step `getaddrinfo`,
+  `_ipv6FailCount`, `_ipv6SuppressedUntil`, 2 failures → 10-min AAAA suppression) that has
+  never been empirically tested against a dead AAAA. Test: point `mqtt_server` at
+  `helite.rnavarro-ryzen.co.crshman.info:8888`→a listener, or mint
+  `helite-mqtt` → live A (172.16.9.106) + dead AAAA; verify connect fails, fail counter
+  increments, suppression engages after 2 failures, MQTT lands on IPv4, and suppression
+  expires/resets correctly on fresh GOT_IP6.
+  Code-review note (done): mqtt.cpp uses STRICT family hints (`AF_INET6` step 1, `AF_INET`
+  fallback), so the lwIP DNS-cache trap IoTaWatt hit (combined addrtypes like
+  `LWIP_DNS_ADDRTYPE_IPV4_IPV6` are satisfied by a cached entry of EITHER family —
+  a flip can silently re-fetch the dead AAAA from cache) does not apply. Strict
+  single-family types are cache-filtered. Keep this invariant: never switch mqtt.cpp's
+  getaddrinfo hints to `AF_UNSPEC`.
+
+- [ ] **GAP 2 — Web auth over IPv6.** All our IPv6 HTTP testing was unauthenticated.
+  IoTaWatt's auth-over-v6 testing found a v4-bypass/v6-prompt asymmetry worth knowing about.
+  Test: enable `www_username`/`www_password`, then `curl -6` with correct creds (expect 200),
+  wrong creds (expect 401), and no creds (expect 401) against the IPv6 global address.
+  Also verify the web UI login flow in a browser over IPv6, and that behavior is symmetric
+  between `curl -4` and `curl -6`.
+
+- [ ] **GAP 3 — IPv6-only readiness: "connected" state is gated on IPv4.** IoTaWatt's E-1
+  finding: their connectivity model gates WL_CONNECTED on DHCPv4, so a v4-less LAN means the
+  device never reports connected and restart-loops. Our net_manager has the same shape:
+  `haveNetworkConnection()` fires only from `ARDUINO_EVENT_WIFI_STA_GOT_IP` / `ETH_GOT_IP`
+  (IPv4 events). On a v6-only network GOT_IP6 fires but the firmware likely never enters
+  NetState::Connected — MQTT/mDNS/NTP/services may never start. Action: code-review
+  `net_manager` state machine for IPv4-event gating BEFORE running the IPv6-only network
+  test, so the test measures reality instead of discovering this blocker the slow way.
+
+- [ ] **GAP 4 — Soak instrumentation.** "No leaks over 1+ week" has no measurement plan.
+  IoTaWatt watches heap + max-free-block over days. Cheap version: cron `curl /status`
+  every 5 min logging `freeram` (and `srssi`) to a file or the existing Grafana stack;
+  alert on monotonic decline. MQTT already publishes freeram in the EmonCMS payload when
+  enabled.
+
+- [x] **Non-gap (verified by our methodology):** dual-stack preference + fresh-connection
+  confound. IoTaWatt found config changes don't drop keepalive connections, silently
+  invalidating preference tests. Our A+AAAA test (test 1) and MQTT upgrade tests used device
+  restarts / explicit reconnects, so our results measured fresh connections. Documented so
+  future tests keep doing this: always force a fresh connection (restart or server-side
+  session kill) when asserting which family a connection uses.
+
 ## Consult-Driven Fixes (2026-06-04)
 
 Three-model consult (GPT-5.5, Opus 4.8, Opus 4.6) reviewed the MQTT IPv6
