@@ -175,7 +175,11 @@ void NetManagerTask::wifiClientConnect()
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(esid.c_str(), epass.c_str());
-  WiFi.enableIpV6();  // Request IPv6 on STA interface (v2.x API, uppercase V)
+  // Request IPv6 on STA interface (v2.x API, uppercase V). May legitimately
+  // fail here if the netif isn't up yet — the STA_CONNECTED handler retries.
+  // Logged to diagnose cold-boot races where IPv6 never initializes.
+  bool ipv6_ok = WiFi.enableIpV6();
+  DEBUG.printf("WiFi enableIpV6 (post-begin): %s\r\n", ipv6_ok ? "OK" : "FAILED");
 
   _clientRetryTime = millis() + WIFI_CLIENT_RETRY_TIMEOUT;
 }
@@ -562,7 +566,12 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       memcpy(dst.bssid, src.bssid, 6);
       dst.channel = src.channel;
       wifiOnStationModeConnected(dst);
-      WiFi.enableIpV6();  // Re-enable IPv6 after disconnect cleared it
+      {
+        // Re-enable IPv6 after disconnect cleared it. This is the call that
+        // matters (netif is up at STA_CONNECTED); log failures.
+        bool ipv6_ok = WiFi.enableIpV6();
+        DEBUG.printf("WiFi enableIpV6 (STA_CONNECTED): %s\r\n", ipv6_ok ? "OK" : "FAILED");
+      }
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_STOP:
@@ -642,7 +651,11 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       break;
     case ARDUINO_EVENT_ETH_CONNECTED:
       DBUGLN("ETH Connected");
-      ETH.enableIpV6();  // Request IPv6 on ETH interface (v2.x API, uppercase V)
+      {
+        // Request IPv6 on ETH interface (v2.x API, uppercase V); log failures
+        bool ipv6_ok = ETH.enableIpV6();
+        DEBUG.printf("ETH enableIpV6 (ETH_CONNECTED): %s\r\n", ipv6_ok ? "OK" : "FAILED");
+      }
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
       DBUG("ETH MAC: ");
