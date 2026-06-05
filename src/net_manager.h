@@ -98,8 +98,12 @@ class NetManagerTask : public MicroTasks::Task
     NetState _state;
     String _ipaddress;
     String _macaddress;
-    String _ipv6address_linklocal;  // Written in Arduino event task only (core 1)
-    String _ipv6address_global;       // Written in Arduino event task only (core 1)
+    String _ipv6address_linklocal_wifi;  // WiFi STA link-local, written in Arduino event task
+    String _ipv6address_global_wifi;      // WiFi STA global, written in Arduino event task
+#ifdef ENABLE_WIRED_ETHERNET
+    String _ipv6address_linklocal_eth;    // ETH link-local, written in Arduino event task
+    String _ipv6address_global_eth;       // ETH global, written in Arduino event task
+#endif
 
     DNSServer _dnsServer;                  // Create class DNS server, captive portal re-direct
     bool _dnsServerStarted;
@@ -154,7 +158,8 @@ class NetManagerTask : public MicroTasks::Task
     void displayState();
     void haveNetworkConnection(IPAddress myAddress);
     void onGlobalIPv6Acquired(const char *ifkey);
-    void onGlobalIPv6Lost();
+    void onGlobalIPv6Lost(const char *ifkey);
+    void handleGotIPv6(esp_ip6_addr_t &addr, const char *ifkey, const char *label);
 
     // Public-fireable event for IPv6 global address transitions.
     // MicroTasks::Event::Trigger() is protected, so we derive and expose it.
@@ -229,16 +234,37 @@ class NetManagerTask : public MicroTasks::Task
       return _ipaddress;
     }
     String getIpv6Global() {
-      return _ipv6address_global;
+      // Return the "best" global IPv6 address: prefer WiFi STA, then ETH.
+      // Most deployments use one interface at a time (when ETH comes up,
+      // WiFi is stopped; when ETH goes down, WiFi starts). The rare case
+      // of both active simultaneously is handled by preferring WiFi since
+      // the device is in STA+AP mode and the WiFi address is reachable
+      // from the LAN. For the common single-interface case, there is no
+      // ambiguity.
+      if (_ipv6address_global_wifi.length() > 0) return _ipv6address_global_wifi;
+#ifdef ENABLE_WIRED_ETHERNET
+      return _ipv6address_global_eth;
+#else
+      return "";
+#endif
     }
     String getIpv6LinkLocal() {
-      return _ipv6address_linklocal;
+      if (_ipv6address_linklocal_wifi.length() > 0) return _ipv6address_linklocal_wifi;
+#ifdef ENABLE_WIRED_ETHERNET
+      return _ipv6address_linklocal_eth;
+#else
+      return "";
+#endif
     }
     String getMac() {
       return _macaddress;
     }
     bool hasGlobalIPv6() {
-      return _ipv6address_global.length() > 0;
+      return _ipv6address_global_wifi.length() > 0
+#ifdef ENABLE_WIRED_ETHERNET
+             || _ipv6address_global_eth.length() > 0
+#endif
+             ;
     }
     void onIPv6GlobalChanged(MicroTasks::EventListener *listener) {
       _ipv6GlobalChanged.Register(listener);
