@@ -1172,21 +1172,44 @@ HE-lite fallback looked correct on paper and failed twice on hardware before ins
 found the real bug — paper analysis of fallback paths is not sufficient. Gaps identified by
 comparing their proven coverage against ours:
 
-- [ ] **GAP 1 — MQTT trap test (highest priority).** The helite blackhole-AAAA test only
-  exercised the Mongoose/EmonCMS path and the mongoose.c cooldown cache. MQTT has a
-  completely separate resolve + suppression mechanism (two-step `getaddrinfo`,
-  `_ipv6FailCount`, `_ipv6SuppressedUntil`, 2 failures → 10-min AAAA suppression) that has
-  never been empirically tested against a dead AAAA. Test: point `mqtt_server` at
-  `helite.rnavarro-ryzen.co.crshman.info:8888`→a listener, or mint
-  `helite-mqtt` → live A (172.16.9.106) + dead AAAA; verify connect fails, fail counter
-  increments, suppression engages after 2 failures, MQTT lands on IPv4, and suppression
-  expires/resets correctly on fresh GOT_IP6.
-  Code-review note (done): mqtt.cpp uses STRICT family hints (`AF_INET6` step 1, `AF_INET`
-  fallback), so the lwIP DNS-cache trap IoTaWatt hit (combined addrtypes like
-  `LWIP_DNS_ADDRTYPE_IPV4_IPV6` are satisfied by a cached entry of EITHER family —
-  a flip can silently re-fetch the dead AAAA from cache) does not apply. Strict
-  single-family types are cache-filtered. Keep this invariant: never switch mqtt.cpp's
-  getaddrinfo hints to `AF_UNSPEC`.
+- [x] **GAP 1 — MQTT trap test — PASSED 2026-06-05** (with two bugs found and fixed, and
+  one cold-boot bug discovered incidentally). Setup: `mqtt_server` →
+  `helite.rnavarro-ryzen.co.crshman.info` (live A → this box + socat forward to the real
+  broker on 1883; dead AAAA `2603:8000:2d00:4605::dead`).
+  **Trap sequence verified on hardware:** AAAA resolved → connect fail #1 (~19s ND
+  timeout, local-VLAN blackhole) → retry, fail #2 → `IPv6 suppressed for 600s` → strict-A
+  resolve returned IPv4 (NOT the cached dead AAAA — strict hints proven cache-filtered) →
+  connected to real broker over IPv4. Total outage ~40s, no crash.
+  **Suppression expiry verified:** expiry is silent while connected (correct — only
+  matters at next attempt); forced reconnect post-expiry → AAAA-first again → one failure
+  (#3) → immediate re-suppression. Finding: `_ipv6FailCount` persists across expiry, so a
+  previously-failed host re-suppresses after ONE post-expiry failure instead of two —
+  escalating distrust, faster fallback (~19s vs ~38s). Counter resets on IPv6 success,
+  fresh GOT_IP6, or reboot. Acceptable, documented.
+  **Finding (acceptable, documented):** MQTT suppression is GLOBAL, not host-keyed
+  (unlike the mongoose.c cooldown cache) — changing `mqtt_server` doesn't reset it, so a
+  user pointing at a new broker stays on IPv4 for the remaining window. Also: after a
+  transient IPv6 outage, MQTT stays on its stable IPv4 connection indefinitely — there is
+  no periodic "retry IPv6" check; only GOT_IP6, reconnect, or reboot re-evaluates. Stable
+  beats optimal for v0.
+  **Bug found+fixed:** DNS cache wasn't keyed to hostname — changing `mqtt_server`
+  connected to the OLD broker's cached IP for up to the 5-min TTL (observed live:
+  `using cached mqtt-server.co.crshman.info -> 172.16.5.10`, the trap host's address).
+  Fixed: `_resolvedFor` member, cache hit requires hostname match (mqtt.cpp/mqtt.h).
+  **Cold-boot bug found+fixed (incidental):** on POWERON_RESET, `enableIpV6()` can fail
+  at BOTH call sites — the STA_CONNECTED call loses a task-timing race (enableIpV6 needs
+  the LwIP netif up, which esp-netif's own STA_CONNECTED handler does; Arduino re-posts
+  events to its own task, ordering not guaranteed). Result: no link-local, no SLAAC, no
+  IPv6 until next warm reboot. Observed 2× on cold boots, 0× on warm boots, intermittent
+  (a later cold boot won the race). Fixed: return codes logged at all three call sites
+  (`post-begin`, `STA_CONNECTED`, `ETH_CONNECTED`) + `_wifiIpv6Enabled` tracking with a
+  retry at GOT_IP (holding a DHCP lease proves the netif is up — retry cannot lose the
+  race). Retry path not yet witnessed firing (race is intermittent); logging will confirm
+  next natural occurrence.
+  Invariant preserved: mqtt.cpp uses STRICT getaddrinfo family hints (`AF_INET6` step 1,
+  `AF_INET` fallback). lwIP combined addrtypes (`LWIP_DNS_ADDRTYPE_IPV4_IPV6`) are
+  satisfied by a cached entry of EITHER family (IoTaWatt's hard-won finding) — never
+  switch these hints to `AF_UNSPEC` or combined types.
 
 - [ ] **GAP 2 — Web auth over IPv6.** All our IPv6 HTTP testing was unauthenticated.
   IoTaWatt's auth-over-v6 testing found a v4-bypass/v6-prompt asymmetry worth knowing about.
