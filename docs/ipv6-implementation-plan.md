@@ -1035,7 +1035,17 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] *Hardware verification: Network page shows IPv6 addresses* — verified
   2026-06-04 in Firefox: Network page displays both `IPv6:` (global) and
   `IPv6 (LL):` (link-local) fields.
-- [ ] *Hardware verification: confirm AP mode captive portal still works*
+- [x] *Hardware verification: confirm AP mode captive portal still works* — verified
+  2026-06-04 on the c9078a1 integration build (dual-stack Mongoose listener +
+  net_manager per-interface refactor). Bogus SSID → AP fallback (~23s of STA
+  retries) → Android phone joined `OpenEVSE_c104` → captive portal **auto-popped**
+  (DNS redirect intact) → setup page served from 192.168.4.1 → selected WLAN_2G →
+  "Connection successful" dialog → device reconnected with full IPv4+IPv6+MQTT
+  in ~6s. Note: post-setup redirect dialog points at the IPv4 literal
+  (`172.16.5.162`) — documented v0 behavior, and the right choice for a client
+  mid-network-hop. SSID config changes require a device restart to apply
+  (`wifiRestartTime` in web_server.cpp is checked but never set — pre-existing
+  upstream quirk, not an IPv6 regression).
 - [x] *End-to-end IPv6-by-hostname from a desktop browser* — verified 2026-06-04:
   Firefox loads `http://openevse-c104.local` over IPv6. Client-side notes for
   Linux desktops (not firmware issues):
