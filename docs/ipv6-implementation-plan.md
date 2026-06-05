@@ -1158,19 +1158,34 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
   hostname (pool.ntp.org has no AAAA; 2.pool.ntp.org does — config change, not code);
   MQTT announce URL uses empty `net.getIp()`; EmonCMS/OCPP function but only tested
   on dual-stack.
-- [ ] Address change resilience — **deferred, low priority**. EUI-64 SLAAC on a stable
-  home prefix means mid-session address changes are rare. Existing TCP connections
-  survive address deprecation (RFC 4862) and only break on flash renumbering
-  (valid-lifetime=0). Already self-heals: dead socket → keepalive timeout → MQTT
-  reconnects → fresh AAAA lookup picks new address. A proper fix requires two changes:
-  (1) replace `had_global` guard in net_manager.cpp:632-637 with `new != current`
-  change-detection, AND (2) add a separate "address changed while already on IPv6 →
-  restart" path in mqtt.cpp:140-161 that bypasses the `!isConnectedViaIPv6()` gate
-  (which currently makes the net_manager fix a no-op in the on-IPv6 case). No
-  `LOST_IP6` event exists in ESP-IDF — address deprecation is silent in LwIP; only
-  option is polling `ip6_addr_state[]` or relying on TCP self-heal. Self-heal is
-  correct for home use. Revisit if upstreaming to users on dynamic ISPs. (Opus review
-  2026-06-04)
+- [x] Address change resilience — **empirically characterized 2026-06-05; behavior fix
+  still deferred** (low priority for static home prefixes; the Opus-review fix design
+  below stands, now with hardware-verified requirements).
+  **Test method:** device on WLAN_IOT (v6-only); a second agent on a VM in that VLAN
+  (172.16.8.100) injected RAs: first a new prefix `fd00:beef::/64`, then a deprecation
+  RA for it (preferred-lifetime 0). Serial + /status + broker observed throughout.
+  **Address-ADD findings:**
+  - New ULA SLAAC'd within ~2s, `GOT_IP6` fired, `handleGotIPv6` ran.
+  - **BUG (cosmetic, real):** the single `_ipv6address_global_wifi` String is
+    last-writer-wins — the test ULA displaced the real GUA in `/status` and
+    `getIpv6Global()`, with no GUA-over-ULA preference. mDNS kept advertising the
+    GUA (slot 0 untouched, `had_global` guard) → API and mDNS now disagree.
+  - Services unaffected: MQTT stayed on its existing connection (correct), web kept
+    serving on both addresses.
+  **Address-DEPRECATE findings:**
+  - **Total firmware silence.** Zero serial output, no event, no state change —
+    confirmed there is no LOST_IP6 path of any kind.
+  - lwIP appears to have *invalidated* the address (it stopped answering ping —
+    suggesting the RFC 4862 §5.5.3.e two-hour valid-lifetime clamp is not enforced),
+    yet `getIpv6Global()` **still reports the now-nonexistent address** while the
+    live, routable GUA goes unreported. The reporting field can reference an address
+    that is no longer on the interface at all.
+  - MQTT survived the entire add/deprecate sequence on its original connection.
+  **Fix requirements (when picked up):** in addition to the Opus-review design
+  (change-detection in net_manager + on-IPv6 restart path in mqtt.cpp), the reported
+  address must be derived from live LwIP state (`esp_netif_get_all_ip6()` with
+  GUA > ULA preference) instead of event-written Strings — events alone cannot track
+  invalidation. Revisit before upstreaming to users on dynamic-prefix ISPs.
 - [x] Memory impact: RAM +136 bytes (+0.04%, 63,360→63,496 of 327,680). Well within heap budget.
 - [x] Flash impact: Flash +11,120 bytes (+0.6%, 1,841,185→1,852,305 of 1,966,080). Fits 16MB partition at 94.2%.
 
