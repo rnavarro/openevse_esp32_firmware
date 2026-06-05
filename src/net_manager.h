@@ -100,6 +100,7 @@ class NetManagerTask : public MicroTasks::Task
     String _macaddress;
     String _ipv6address_linklocal_wifi;  // WiFi STA link-local, written in Arduino event task
     String _ipv6address_global_wifi;      // WiFi STA global, written in Arduino event task
+    bool _wifiIpv6Enabled = false;        // enableIpV6 succeeded; GOT_IP retries if false (cold-boot race)
 #ifdef ENABLE_WIRED_ETHERNET
     String _ipv6address_linklocal_eth;    // ETH link-local, written in Arduino event task
     String _ipv6address_global_eth;       // ETH global, written in Arduino event task

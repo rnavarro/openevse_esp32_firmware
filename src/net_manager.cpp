@@ -566,12 +566,14 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       memcpy(dst.bssid, src.bssid, 6);
       dst.channel = src.channel;
       wifiOnStationModeConnected(dst);
-      {
-        // Re-enable IPv6 after disconnect cleared it. This is the call that
-        // matters (netif is up at STA_CONNECTED); log failures.
-        bool ipv6_ok = WiFi.enableIpV6();
-        DEBUG.printf("WiFi enableIpV6 (STA_CONNECTED): %s\r\n", ipv6_ok ? "OK" : "FAILED");
-      }
+      // Re-enable IPv6 after disconnect cleared it. This can FAIL on cold
+      // boot (POWERON_RESET): enableIpV6 needs the LwIP netif marked up,
+      // which happens in esp-netif's own STA_CONNECTED handler — Arduino
+      // re-posts events to its own task, so ordering is a race that cold-
+      // boot task timing loses. Track the result; GOT_IP retries (the netif
+      // is provably up once we hold an IPv4 address).
+      _wifiIpv6Enabled = WiFi.enableIpV6();
+      DEBUG.printf("WiFi enableIpV6 (STA_CONNECTED): %s\r\n", _wifiIpv6Enabled ? "OK" : "FAILED");
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_STOP:
@@ -599,6 +601,12 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
       dst.mask = src.netmask.addr;
       dst.gw = src.gw.addr;
       wifiOnStationModeGotIP(dst);
+      if (!_wifiIpv6Enabled) {
+        // STA_CONNECTED enableIpV6 lost the netif-up race (cold boot).
+        // Retry now: holding an IPv4 address proves the netif is up.
+        _wifiIpv6Enabled = WiFi.enableIpV6();
+        DEBUG.printf("WiFi enableIpV6 (GOT_IP retry): %s\r\n", _wifiIpv6Enabled ? "OK" : "FAILED");
+      }
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
