@@ -206,11 +206,11 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
 
   DEBUG.printf("Connected, IP: %s\r\n", tmpStr);
 
-  if (_ipv6address_global.length() > 0) {
-    DEBUG.printf("Connected, IPv6 global: %s\r\n", _ipv6address_global.c_str());
+  if (getIpv6Global().length() > 0) {
+    DEBUG.printf("Connected, IPv6 global: %s\r\n", getIpv6Global().c_str());
   }
-  if (_ipv6address_linklocal.length() > 0) {
-    DEBUG.printf("Connected, IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
+  if (getIpv6LinkLocal().length() > 0) {
+    DEBUG.printf("Connected, IPv6 link-local: %s\r\n", getIpv6LinkLocal().c_str());
   }
 
   // Debug: print DNS servers (v4 and v6) from active netif
@@ -307,22 +307,70 @@ void NetManagerTask::onGlobalIPv6Acquired(const char *ifkey)
 
   // Notify web UI and other event subscribers
   StaticJsonDocument<128> doc;
-  doc["ipv6_global"] = _ipv6address_global;
+  doc["ipv6_global"] = getIpv6Global();
   doc["ipv6_event"] = "acquired";
   event_send(doc);
 }
 
-void NetManagerTask::onGlobalIPv6Lost()
+void NetManagerTask::handleGotIPv6(esp_ip6_addr_t &addr, const char *ifkey, const char *label)
 {
-  bool had_global = _ipv6address_global.length() > 0;
-  _ipv6address_global = "";
-  _ipv6address_linklocal = "";
+  esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
+  String addr_str = IPv6Address(addr.addr).toString();
 
+  if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
+#ifdef ENABLE_WIRED_ETHERNET
+    if (strcmp(ifkey, "ETH_DEF") == 0) {
+      _ipv6address_linklocal_eth = addr_str;
+    } else
+#endif
+    {
+      _ipv6address_linklocal_wifi = addr_str;
+    }
+    DEBUG.printf("Connected, %s IPv6 link-local: %s\r\n", label, addr_str.c_str());
+  } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
+    String *global_field = nullptr;
+#ifdef ENABLE_WIRED_ETHERNET
+    if (strcmp(ifkey, "ETH_DEF") == 0) {
+      global_field = &_ipv6address_global_eth;
+    } else
+#endif
+    {
+      global_field = &_ipv6address_global_wifi;
+    }
+    bool had_global = global_field && global_field->length() > 0;
+    if (global_field) *global_field = addr_str;
+    DEBUG.printf("Connected, %s IPv6 global: %s\r\n", label, addr_str.c_str());
+    if (!had_global) {
+      onGlobalIPv6Acquired(ifkey);
+    }
+  }
+  Mongoose.ipConfigChanged();
+}
+
+void NetManagerTask::onGlobalIPv6Lost(const char *ifkey)
+{
+  // Only clear the global address for the interface that lost connectivity.
+  // Link-local is tied to the interface MAC and persists across
+  // reassociations — it should only be cleared on interface stop,
+  // not on transient disconnects. It will be updated naturally when
+  // the next GOT_IP6 event fires after reconnection.
+  String *global_field = nullptr;
+#ifdef ENABLE_WIRED_ETHERNET
+  if (strcmp(ifkey, "ETH_DEF") == 0) {
+    global_field = &_ipv6address_global_eth;
+  } else
+#endif
+  if (strcmp(ifkey, "WIFI_STA_DEF") == 0) {
+    global_field = &_ipv6address_global_wifi;
+  }
+
+  bool had_global = global_field && global_field->length() > 0;
   if (had_global) {
+    *global_field = "";
     _ipv6GlobalChanged.Fire();
 
     StaticJsonDocument<64> doc;
-    doc["ipv6_global"] = "";
+    doc["ipv6_global"] = getIpv6Global();
     doc["ipv6_event"] = "lost";
     event_send(doc);
   }
@@ -350,7 +398,7 @@ void NetManagerTask::wifiOnStationModeGotIP(const WiFiEventStationModeGotIP &eve
 
 void NetManagerTask::wifiOnStationModeDisconnected(const WiFiEventStationModeDisconnected &event)
 {
-  onGlobalIPv6Lost();
+  onGlobalIPv6Lost("WIFI_STA_DEF");
 
   DBUGF("WiFi dissconnected: %s",
     WIFI_DISCONNECT_REASON_UNSPECIFIED == event.reason ? "WIFI_DISCONNECT_REASON_UNSPECIFIED" :
@@ -519,6 +567,9 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
 
     case ARDUINO_EVENT_WIFI_STA_STOP:
     {
+      // Interface is going down completely — clear both global and link-local
+      _ipv6address_global_wifi = "";
+      _ipv6address_linklocal_wifi = "";
     } break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
@@ -544,19 +595,7 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
     case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
     {
       esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
-      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
-      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
-        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
-        DEBUG.printf("Connected, WiFi IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
-      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
-        bool had_global = _ipv6address_global.length() > 0;
-        _ipv6address_global = IPv6Address(addr.addr).toString();
-        DEBUG.printf("Connected, WiFi IPv6 global: %s\r\n", _ipv6address_global.c_str());
-        if (!had_global) {
-          onGlobalIPv6Acquired("WIFI_STA_DEF");
-        }
-      }
-      Mongoose.ipConfigChanged();
+      handleGotIPv6(addr, "WIFI_STA_DEF", "WiFi");
     } break;
 
     case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
@@ -624,29 +663,18 @@ void NetManagerTask::onNetEvent(WiFiEvent_t event, arduino_event_info_t &info)
     case ARDUINO_EVENT_ETH_GOT_IP6:
     {
       esp_ip6_addr_t addr = info.got_ip6.ip6_info.ip;
-      esp_ip6_addr_type_t addr_type = esp_netif_ip6_get_addr_type(&addr);
-      if (addr_type == ESP_IP6_ADDR_IS_LINK_LOCAL) {
-        _ipv6address_linklocal = IPv6Address(addr.addr).toString();
-        DEBUG.printf("Connected, ETH IPv6 link-local: %s\r\n", _ipv6address_linklocal.c_str());
-      } else if (addr_type == ESP_IP6_ADDR_IS_GLOBAL || addr_type == ESP_IP6_ADDR_IS_UNIQUE_LOCAL) {
-        bool had_global = _ipv6address_global.length() > 0;
-        _ipv6address_global = IPv6Address(addr.addr).toString();
-        DEBUG.printf("Connected, ETH IPv6 global: %s\r\n", _ipv6address_global.c_str());
-        if (!had_global) {
-          onGlobalIPv6Acquired("ETH_DEF");
-        }
-      }
-      Mongoose.ipConfigChanged();
+      handleGotIPv6(addr, "ETH_DEF", "ETH");
     } break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       DBUGLN("ETH Disconnected");
-      onGlobalIPv6Lost();
+      onGlobalIPv6Lost("ETH_DEF");
       _ethConnected = false;
       wifiStart();
       break;
     case ARDUINO_EVENT_ETH_STOP:
       DBUGLN("ETH Stopped");
-      onGlobalIPv6Lost();
+      onGlobalIPv6Lost("ETH_DEF");
+      _ipv6address_linklocal_eth = "";  // Interface going down — clear link-local too
       _ethConnected = false;
       break;
 #endif

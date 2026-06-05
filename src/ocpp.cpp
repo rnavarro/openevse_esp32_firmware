@@ -34,6 +34,9 @@ private:
     bool (*configGetBoolCb)() = nullptr;
     String *configString = nullptr;
     MicroOcpp::TConfig type;
+#if MG_ENABLE_IPV6
+    String _ipv6Bracketed;  // Cached bracket-enclosed URL for IPv6, avoids mutating source config
+#endif
 
     OcppConfigAdapter(OcppTask& ocppTask, const char *keyOcpp, const char *keyOpenEvse, MicroOcpp::TConfig type)
             : ocppTask(ocppTask), keyOcpp(keyOcpp), keyOpenEvse(keyOpenEvse), type(type) {
@@ -85,13 +88,16 @@ public:
     const char *getString() override { //always returns c-string (empty if undefined)
         if (!configString || !configString->c_str()) return "";
 #if MG_ENABLE_IPV6
-        // Ensure IPv6 literals in URLs are bracket-enclosed for Mongoose URL parsing
-        // Cache the corrected string since we must return const char*
+        // Ensure IPv6 literals in URLs are bracket-enclosed for Mongoose URL parsing.
+        // Use a member cache to avoid mutating the source config String (which
+        // is a pointer to the global ocpp_server — mutating it would corrupt
+        // the user's stored config and persist the bracketed form to flash).
         if (strcmp(keyOcpp, MO_CONFIG_EXT_PREFIX "BackendUrl") == 0 ||
             strcmp(keyOpenEvse, "ocpp_server") == 0) {
-            String corrected = ensureIpv6Brackets(*configString);
-            if (corrected != *configString) {
-                *configString = corrected;
+            if (configString->indexOf(':') >= 0) {
+                // Only compute if the address might be IPv6 (contains colons)
+                _ipv6Bracketed = ensureIpv6Brackets(*configString);
+                return _ipv6Bracketed.c_str();
             }
         }
 #endif
