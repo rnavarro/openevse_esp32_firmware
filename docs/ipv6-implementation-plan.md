@@ -1029,9 +1029,24 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] HTTP OTA — uses file upload, not URL-based (no change needed)
 - [x] Web UI displays `ipv6address_global` and `ipv6address_linklocal` on Network page
 - [x] Captive portal IPv4-only in v0 (confirmed no v0/v2 blockers)
-- [ ] *Hardware verification: test entering IPv6 addresses in MQTT/EmonCMS/OCPP config fields*
-- [ ] *Hardware verification: confirm Network page shows IPv6 addresses*
+- [x] *Hardware verification: IPv6 literals in config fields* — verified 2026-06-04:
+  EmonCMS server field accepted `http://[2603:…:d490]:8888` via web UI without
+  mangling; saved, persisted, and posted successfully over IPv6.
+- [x] *Hardware verification: Network page shows IPv6 addresses* — verified
+  2026-06-04 in Firefox: Network page displays both `IPv6:` (global) and
+  `IPv6 (LL):` (link-local) fields.
 - [ ] *Hardware verification: confirm AP mode captive portal still works*
+- [x] *End-to-end IPv6-by-hostname from a desktop browser* — verified 2026-06-04:
+  Firefox loads `http://openevse-c104.local` over IPv6. Client-side notes for
+  Linux desktops (not firmware issues):
+  - Ubuntu's default nsswitch uses `mdns4_minimal` (IPv4-only) — switch to
+    `mdns_minimal` for AAAA from `.local` via libc.
+  - Snap-packaged browsers (Firefox, Chromium) cannot use host nsswitch mDNS
+    modules at all (long-standing snapd issue, forum.snapcraft.io/t/7603).
+    Fix system-wide via systemd-resolved: `MulticastDNS=resolve` in
+    /etc/systemd/resolved.conf.d/mdns.conf + `resolvectl mdns <link> resolve` —
+    snaps query 127.0.0.53 and get mDNS AAAA+A from resolved.
+  - Firefox caches negative DNS results ~60s — clear via about:networking#dns.
 
 **GUI Fork & Submodule Setup (completed):**
 
