@@ -1211,27 +1211,53 @@ comparing their proven coverage against ours:
   satisfied by a cached entry of EITHER family (IoTaWatt's hard-won finding) — never
   switch these hints to `AF_UNSPEC` or combined types.
 
-- [ ] **GAP 2 — Web auth over IPv6.** All our IPv6 HTTP testing was unauthenticated.
-  IoTaWatt's auth-over-v6 testing found a v4-bypass/v6-prompt asymmetry worth knowing about.
-  Test: enable `www_username`/`www_password`, then `curl -6` with correct creds (expect 200),
-  wrong creds (expect 401), and no creds (expect 401) against the IPv6 global address.
-  Also verify the web UI login flow in a browser over IPv6, and that behavior is symmetric
-  between `curl -4` and `curl -6`.
+- [x] **GAP 2 — Web auth over IPv6 — PASSED 2026-06-05.** Full matrix with
+  `www_username`/`www_password` set:
+  | Path | no creds | wrong creds | correct creds |
+  |---|---|---|---|
+  | IPv4 (172.16.5.162) | 401 | 401 | 200 |
+  | IPv6 global | 401 | 401 | 200 |
+  | IPv6 link-local (`%bond0` zone) | — | — | 200 |
+  Perfectly symmetric. `WWW-Authenticate: Basic realm=openevse-c104` header present on
+  IPv6 401s (browser prompt works). No IoTaWatt-style asymmetry possible by construction:
+  OpenEVSE auth (`requestPreProcess`, web_server.cpp:151) is pure HTTP Basic with no
+  remote-IP/subnet bypass logic — the only IP-dependent branch is the AP-mode exemption
+  (`isWifiModeApOnly`), which is interface-wide, not address-family-dependent.
 
-- [ ] **GAP 3 — IPv6-only readiness: "connected" state is gated on IPv4.** IoTaWatt's E-1
-  finding: their connectivity model gates WL_CONNECTED on DHCPv4, so a v4-less LAN means the
-  device never reports connected and restart-loops. Our net_manager has the same shape:
-  `haveNetworkConnection()` fires only from `ARDUINO_EVENT_WIFI_STA_GOT_IP` / `ETH_GOT_IP`
-  (IPv4 events). On a v6-only network GOT_IP6 fires but the firmware likely never enters
-  NetState::Connected — MQTT/mDNS/NTP/services may never start. Action: code-review
-  `net_manager` state machine for IPv4-event gating BEFORE running the IPv6-only network
-  test, so the test measures reality instead of discovering this blocker the slow way.
+- [x] **GAP 3 — IPv6-only readiness code review — DONE 2026-06-05. Blocker CONFIRMED**
+  (fix deferred to the IPv6-only phase; do not run the IPv6-only network test before
+  fixing). Exact same class as IoTaWatt's E-1, traced through both layers:
+  1. **Arduino core v2.0.17** (`WiFiGeneric.cpp:1105` vs `:1144`): `GOT_IP` calls
+     `WiFiSTAClass::_setStatus(WL_CONNECTED)`; `GOT_IP6` only sets
+     `STA_CONNECTED_BIT | STA_HAS_IP6_BIT` — never WL_CONNECTED. `WiFi.isConnected()`
+     is `status() == WL_CONNECTED`, so it stays false forever without DHCPv4.
+  2. **Firmware consequences on a v6-only LAN:**
+     - `net.isConnected()` false → MQTT never attempts (mqtt.cpp:165 gate); EmonCMS
+       publish loop in main.cpp also gated on connected state
+     - `_state` never reaches `NetState::Connected` (only set in
+       `haveNetworkConnection()`, called solely from IPv4 GOT_IP handlers) → mDNS never
+       starts, LCD shows connecting state forever
+     - Worst: state machine stuck in `StationClientConnecting` →
+       `if(!isWifiClientConnected()) wifiClientConnect()` on every retry timeout →
+       **WiFi re-association churn loop** (repeated WiFi.begin while associated),
+       potentially escalating to AP fallback via `_clientDisconnects`
+     - Only the web server works (Mongoose listener starts at boot,
+       connection-state-independent) — reachable over v6 but the device is otherwise dead
+  3. **Fix sketch (for the IPv6-only phase):** treat a global IPv6 acquisition as
+     network-up — in `handleGotIPv6()`, if global/ULA and `_state != Connected`, run a
+     v6-aware variant of `haveNetworkConnection()`; and make `isWifiClientConnected()`
+     accept `STA_HAS_IP6_BIT` (via `WiFiGenericClass::getStatusBits()`) as an
+     alternative to WL_CONNECTED. Must not regress dual-stack: on v4+v6 networks the
+     IPv4 path usually wins the race and nothing changes.
 
-- [ ] **GAP 4 — Soak instrumentation.** "No leaks over 1+ week" has no measurement plan.
-  IoTaWatt watches heap + max-free-block over days. Cheap version: cron `curl /status`
-  every 5 min logging `freeram` (and `srssi`) to a file or the existing Grafana stack;
-  alert on monotonic decline. MQTT already publishes freeram in the EmonCMS payload when
-  enabled.
+- [x] **GAP 4 — Soak instrumentation — DEPLOYED 2026-06-05.**
+  `~/.local/bin/openevse-soak-poll` (on rnavarro-ryzen) polls `/status` every 5 min via
+  crontab, appending CSV to `~/openevse-soak.csv`: timestamp, host, reachability,
+  freeram, uptime, srssi, IPv4, IPv6 global. Catches heap creep (monotonic freeram
+  decline), silent reboots (uptime reset), WiFi degradation, and IPv6 address loss.
+  Baseline at deploy: freeram 175,720 / uptime 625s on the c9078a1+fixes build.
+  Soak clock started 2026-06-05 ~00:35 PT. Review after a week:
+  `awk -F, '{print $1, $4, $5}' ~/openevse-soak.csv | less` or chart it.
 
 - [x] **Non-gap (verified by our methodology):** dual-stack preference + fresh-connection
   confound. IoTaWatt found config changes don't drop keepalive connections, silently
