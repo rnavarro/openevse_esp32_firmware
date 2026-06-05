@@ -1070,13 +1070,70 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
   `integration` is ephemeral and local-only — never pushed.
 
 **Phase 5 (Hardening and Testing):**
-- [ ] IPv6 addresses restored after WiFi reconnect (not tested on Olimex — WiFi-only test)
-- [ ] EmonCMS posts work over IPv6
-- [ ] HTTP OTA updates work over IPv6
+- [x] IPv6 addresses restored after WiFi reconnect — **verified 2026-06-04 on Olimex**.
+  ETH unplug → AP mode → WiFi STA → IPv4 MQTT → IPv6 upgrade all work correctly.
+  WiFi uses `c104` MAC suffix (different from ETH `c107`), gets its own SLAAC global
+  address `2603:8000:2d00:4605:b68a:0aff:fe75:c104`. MQTT broker log confirms clean
+  upgrade pattern with no duplicate sessions or stuck connections. ETH→WiFi transition
+  takes ~92s (AP mode timeout before STA attempt) — expected behavior, not a bug.
+- [x] MQTT broker confirms clean IPv6 operation — verified against gokrazy mqtt-server
+  log (`http://mqtt-server/log?path=%2fuser%2fmqtt-server&stream=stdout`). Every boot
+  shows IPv4 connect → clean DISCONNECT + FIN → IPv6 connect. ETH unplug detected via
+  keepalive i/o timeout (~85s, = 1.5× 60s keepalive). `"use of closed network
+  connection"` errors in broker log are normal Go behavior for a clean remote TCP close
+  during a blocking read — firmware sends proper MQTT DISCONNECT before FIN.
+- [x] EmonCMS posts work over IPv6 — verified 2026-06-04 on Olimex (WiFi) against a
+  mock EmonCMS server with four DNS configurations:
+  | Host config | Result | Path |
+  |---|---|---|
+  | A+AAAA | success ~100ms | IPv6 |
+  | A only | success ~100ms | IPv4 |
+  | AAAA only | success ~100ms | IPv6 |
+  | valid A + blackhole AAAA | 1st attempt 23s timeout, retry 98ms | IPv4 via cooldown |
+  Testing surfaced two real bugs, both fixed in the ArduinoMongoose fork
+  (commit 865d00d on fix/ipv6-dual-stack):
+  1. **Nameserver corruption**: `WiFi.dnsIP(0)` read the first 4 bytes of an IPv6
+     RDNSS server in LwIP DNS slot 0 as IPv4 — `fd00::...` became `253.0.0.0`,
+     silently breaking ALL Mongoose DNS (EmonCMS, OCPP, SNTP, OHM) once a global
+     IPv6 address arrived. Fixed: `esp_netif_get_dns_info()` with explicit
+     address-type checking (prefer IPv4 DNS, fall back to IPv6 RDNSS).
+  2. **No IPv6 connect-failure fallback**: AAAA-first DNS fell back to A only when
+     no AAAA record existed. If the AAAA resolved but the IPv6 TCP connect failed
+     (blackhole route), the connection just timed out with no IPv4 retry — and this
+     affected every Mongoose TCP client. Fixed with a host-keyed cooldown cache in
+     mongoose.c (6 slots, 5-min TTL, ~330B static): an IPv6 connect failure records
+     the hostname; subsequent connects for that host skip AAAA and resolve A
+     directly, so app-level retries (EmonCMS cycle, OCPP reconnect) succeed fast
+     over IPv4. Per-host keyed — hosts with working IPv6 unaffected. IP literals
+     never enter the cache. SNTP (UDP, connectionless) keeps its own timeout-retry.
+     Design per Opus consult; a first attempt at an in-poll-loop re-resolve caused
+     a use-after-free crash loop (Mongoose owns the nc lifecycle — never pause a
+     failed connection for re-resolve; fresh connection per attempt only).
+  Bonus fix: `mg_destroy_conn` never freed the hostname strdup'd for AAAA→A
+  fallback — leaked on every successful AAAA resolve. Now freed.
+- [x] HTTP OTA updates work over IPv6 — verified 2026-06-04 on Olimex over WiFi IPv6.
+  1.8MB firmware upload to `http://[2603:…:c104]/update` returned HTTP 200. Device
+  rebooted and came back with full IPv4+IPv6 in ~12.6s. Command:
+  `curl -6 --max-time 120 -F "file=@firmware.bin" "http://[<ipv6>]/update"`
+  Bonus: a truncated upload (60s timeout, 81% complete) triggered automatic OTA
+  rollback — ESP32 bootloader detected `invalid segment length 0xffffffff` and
+  reverted to previous firmware. OTA safety net confirmed working.
 - [ ] No memory leaks or crashes over 1+ week runtime
 - [x] IPv4-mapped addresses display as `a.b.c.d` not `::ffff:a.b.c.d` in debug logs — **non-issue confirmed**: Mongoose `inet_ntoa()` calls operate on `nc->sa.sin.sin_addr` (IPv4-only struct, can't produce `::ffff:` output). Application-layer IPv6 display uses LwIP's `ip6addr_ntoa()` which produces proper `2001:db8::1` notation. DNS-level IPv4-mapped filtering in `mqtt.cpp` two-step `getaddrinfo()` prevents `::ffff:` from ever reaching the connect path.
 - [ ] IPv6-only network test: disable IPv4, verify EVSE still functions
-- [ ] Address change resilience: verify firmware handles IPv6 address churn gracefully
+- [ ] Address change resilience — **deferred, low priority**. EUI-64 SLAAC on a stable
+  home prefix means mid-session address changes are rare. Existing TCP connections
+  survive address deprecation (RFC 4862) and only break on flash renumbering
+  (valid-lifetime=0). Already self-heals: dead socket → keepalive timeout → MQTT
+  reconnects → fresh AAAA lookup picks new address. A proper fix requires two changes:
+  (1) replace `had_global` guard in net_manager.cpp:632-637 with `new != current`
+  change-detection, AND (2) add a separate "address changed while already on IPv6 →
+  restart" path in mqtt.cpp:140-161 that bypasses the `!isConnectedViaIPv6()` gate
+  (which currently makes the net_manager fix a no-op in the on-IPv6 case). No
+  `LOST_IP6` event exists in ESP-IDF — address deprecation is silent in LwIP; only
+  option is polling `ip6_addr_state[]` or relying on TCP self-heal. Self-heal is
+  correct for home use. Revisit if upstreaming to users on dynamic ISPs. (Opus review
+  2026-06-04)
 - [x] Memory impact: RAM +136 bytes (+0.04%, 63,360→63,496 of 327,680). Well within heap budget.
 - [x] Flash impact: Flash +11,120 bytes (+0.6%, 1,841,185→1,852,305 of 1,966,080). Fits 16MB partition at 94.2%.
 
@@ -1455,6 +1512,55 @@ Additionally, 7.x natively addresses every one of Jeremy's local patches on 6.18
 **Why we're not doing it now:** Mongoose 7.x is a complete API rewrite — different event handler signatures, different connection struct, different HTTP/MQTT/SNTP APIs, different address handling. Every C++ wrapper in ArduinoMongoose (`MongooseCore`, `MongooseHttpServer`, `MongooseHttpClient`, `MongooseMqttClient`, `MongooseSntpClient`, `MongooseWebSocketClient`) would need a ground-up rewrite. The OpenEVSE firmware has thousands of lines using the 6.18 API. Migration is weeks of work with high regression risk.
 
 **Strategic position:** Our ArduinoMongoose fork with 6.18 IPv6 patches is the pragmatically correct approach for now. If a Mongoose 7.x migration ever becomes warranted, it would replace our entire fork — all 6.18-specific patches (both Jeremy's and ours) become obsolete. The firmware-level changes (Phase 1: `enableIpV6()`, GOT_IP6 handlers, API reporting) are Mongoose-version-independent and would carry forward unchanged. **Do not invest in 6.18 patches that would complicate a future 7.x migration** — keep patches minimal and well-documented.
+
+---
+
+### Boot Timing Analysis — Serial + Packet Correlation
+
+**Timestamped serial capture** (relative to boot ROM = T+0):
+```
+T+ 0.000s  Boot ROM (reset)
+T+ 0.762s  OpenEVSE WiFi / Firmware banner
+T+ 0.840s  VFS error: /littlefs/schedule.json (harmless — first boot)
+T+ 2.826s  Server started
+T+ 3.332s  OpenEVSE not responding (first RAPI poll)
+T+ 4.201s  Connected, ETH IPv6 link-local  ← link-local DAD complete
+T+ 7.274s  Connected, IP: 172.16.5.158    ← DHCP complete (IPv4 up)
+T+ 7.283s  Connected, IPv6 link-local (duplicate — from haveNetworkConnection)
+T+ 7.334s  MQTT resolved → IPv4 172.16.9.106
+T+ 7.340s  MQTT Connecting (IPv4)
+T+12.202s  Connected, ETH IPv6 global     ← SLAAC DAD complete (GOT_IP6)
+T+12.237s  MQTT: upgrading connection to IPv6
+T+12.393s  MQTT resolved → IPv6 2603:…
+T+12.408s  MQTT connected over IPv6       ← fully operational on IPv6
+```
+
+**IPv4 MQTT ready: T+7.3s | IPv6 MQTT ready: T+12.4s | Gap: ~5.1s**
+
+The 5s gap is almost entirely the RS #1 dropped response (4s RFC retransmit timeout).
+If RS #1 were answered, IPv6 global would be ~T+8s and MQTT on IPv6 by ~T+8.5s.
+
+**Known anomalies (harmless):**
+- `Connected, IPv6 link-local` appears twice: once from `ARDUINO_EVENT_ETH_GOT_IP6`
+  at T+4.2s (correct), and once from `haveNetworkConnection()` at T+7.3s (dumps
+  whatever IPv6 state is already known when IPv4 arrives).
+- `Connected, ETH IPv6 global` fires a second time ~60s post-boot: ESP-IDF re-fires
+  `GOT_IP6` when the router RA refreshes the prefix lifetime. The `had_global` guard
+  in net_manager.cpp prevents a redundant `onGlobalIPv6Acquired()` call.
+
+**How to capture timestamped serial output (relative T+0 from first byte):**
+```bash
+sudo picocom -b 115200 /dev/ttyUSB2 --quiet | ts -s '[%H:%M:%.S]'
+# requires: sudo apt install moreutils
+# T=0 = first byte from serial (boot ROM or running firmware, whichever comes first)
+# Reset the device after starting picocom to get clean T=0 from boot ROM
+```
+
+**Why RS #1 gets no RA response (open question):**
+Packet analysis shows RS #1 goes out at T+3.5s (boot), RS #2 at T+7.5s. Only RS #2
+triggers an RA. Likely cause: router RA rate-limiting (min ~3s between solicited RAs
+per RFC 4861 §6.2.6), and RS #1 landed within the rate-limit window of a recent
+unsolicited RA. No firmware fix needed — this is router policy behavior.
 
 ---
 

@@ -47,6 +47,9 @@ void emoncms_publish(JsonDocument &data)
 {
   Profile_Start(emoncms_publish);
 
+  DEBUG.printf("EmonCMS: publish called, enabled=%d apikey_len=%d\r\n",
+               (int)config_emoncms_enabled(), emoncms_apikey.length());
+
   if (config_emoncms_enabled() && emoncms_apikey != 0)
   {
     String url = ensureIpv6Brackets(emoncms_server) + post_path;
@@ -61,7 +64,7 @@ void emoncms_publish(JsonDocument &data)
     url += "&apikey=";
     url += emoncms_apikey;
 
-    DBUGVAR(url);
+    DEBUG.printf("EmonCMS: GET %s\r\n", url.substring(0, url.indexOf("apikey=") + 15).c_str());
     packets_sent++;
 
     auto state = new EmonCmsClientState;
@@ -71,7 +74,7 @@ void emoncms_publish(JsonDocument &data)
     client.get(url, [state](MongooseHttpClientResponse *response)
     {
       MongooseString result = response->body();
-      DBUGF("result = %.*s", result.length(), result.c_str());
+      DEBUG.printf("EmonCMS: response %.*s\r\n", result.length(), result.c_str());
 
       state->connected = true;
 
@@ -89,19 +92,20 @@ void emoncms_publish(JsonDocument &data)
         packets_success++;
         emoncms_result(true, result);
       } else {
-        DEBUG.print("Emoncms error: ");
-        DEBUG.printf("%.*s\n", result.length(), (const char *)result);
+        DEBUG.printf("EmonCMS error: %.*s\r\n", result.length(), (const char *)result);
         emoncms_result(false, result.toString());
       }
     }, [state]()
     {
-      DBUGF("onClose");
+      DEBUG.printf("EmonCMS: onClose connected=%d\r\n", (int)state->connected);
       if(false == state->connected) {
         emoncms_result(false, String("Failed to connect"));
       }
       delete state;
     });
   } else {
+    DEBUG.printf("EmonCMS: skipped (enabled=%d apikey_empty=%d)\r\n",
+                 (int)config_emoncms_enabled(), emoncms_apikey.isEmpty());
     if(false != emoncms_connected) {
       emoncms_result(false, String("Disabled"));
     }
