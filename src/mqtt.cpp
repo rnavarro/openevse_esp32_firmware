@@ -212,28 +212,37 @@ void Mqtt::attemptConnection() {
 
   // Fast path: if mqtt_server is already an IP literal, skip DNS entirely.
   // IPv4 literal: "192.168.1.1"  IPv6 literal: "2001:db8::1" or "::1"
+  // Also handles bracketed IPv6: "[2001:db8::1]" (user may enter this format)
   bool server_is_ip_literal = false;
   {
-    // Simple heuristic: contains only hex digits, dots, colons, and no alpha
-    // (hostname must have at least one letter to be a DNS name)
+    // Strip leading/trailing brackets for IPv6 detection, then check if the
+    // remaining characters are all hex digits, dots, and colons — no alpha
+    // means it's an IP literal, not a hostname. (Hostnames must have at
+    // least one letter to be a valid DNS name.)
     const char *p = mqtt_server.c_str();
+    if (*p == '[') p++;  // Skip leading bracket
     server_is_ip_literal = true;
     while (*p) {
+      if (*p == ']' && *(p+1) == '\0') { p++; break; }  // Trailing bracket
       if (isalpha(*p)) { server_is_ip_literal = false; break; }
       p++;
     }
   }
 
   if (server_is_ip_literal) {
-    // Server is already an IP literal — no DNS needed. Only need to check
-    // if it's IPv6 so we can wrap in brackets for Mongoose.
-    mqtt_host = mqtt_server + ":" + String(mqtt_port);
-    if (mqtt_server.indexOf(':') >= 0) {
+    // Server is already an IP literal — no DNS needed. Strip any brackets
+    // the user may have included, then re-add for Mongoose URL format.
+    String bare_server = mqtt_server;
+    if (bare_server.startsWith("[") && bare_server.endsWith("]")) {
+      bare_server = bare_server.substring(1, bare_server.length() - 1);
+    }
+    if (bare_server.indexOf(':') >= 0) {
       // IPv6 literal — wrap in brackets for Mongoose URL format
-      mqtt_host = "[" + mqtt_server + "]:" + String(mqtt_port);
+      mqtt_host = "[" + bare_server + "]:" + String(mqtt_port);
       resolved_ipv6 = true;
       DEBUG.printf("MQTT: server is IPv6 literal, skipping DNS\r\n");
     } else {
+      mqtt_host = bare_server + ":" + String(mqtt_port);
       DEBUG.printf("MQTT: server is IPv4 literal, skipping DNS\r\n");
     }
   } else {
