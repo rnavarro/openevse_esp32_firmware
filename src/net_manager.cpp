@@ -347,6 +347,32 @@ void NetManagerTask::handleGotIPv6(esp_ip6_addr_t &addr, const char *ifkey, cons
     if (!had_global) {
       onGlobalIPv6Acquired(ifkey);
     }
+
+    // IPv6-only network support: a routable IPv6 address means the network is
+    // usable even if DHCPv4 never answers. Without this, _state never leaves
+    // StationClientConnecting on a v4-less LAN: services stay gated off and
+    // the retry timer tears down the association every 10s (observed live —
+    // teardown ~2s AFTER SLAAC completed). On dual-stack networks IPv4 GOT_IP
+    // normally wins this race and the block is a no-op.
+    if (NetState::Connected != _state) {
+      DEBUG.printf("Network up via %s IPv6 global (no IPv4)\r\n", label);
+#ifdef ENABLE_WIRED_ETHERNET
+      if (strcmp(ifkey, "ETH_DEF") == 0) {
+        _macaddress = ETH.macAddress();
+        _ethConnected = true;
+        wifiStop();
+      } else
+#endif
+      {
+        _macaddress = WiFi.macAddress();
+      }
+      _time.setHost(sntp_hostname.c_str());
+      displayState();
+      _led.setWifiMode(true, true);
+      _lcd.setWifiMode(true, true);
+      _apAutoApStopTime = millis() + ACCESS_POINT_AUTO_STOP_TIMEOUT;
+      _state = NetState::Connected;
+    }
   }
   Mongoose.ipConfigChanged();
 }
@@ -869,7 +895,31 @@ unsigned long NetManagerTask::manageState()
       // Intentionally fall through to AP State for the same client reconnect logic
     case NetState::AccessPointConnecting:
       if(!isWifiClientConnected() && esid != 0 && esid != "" && millis() > _clientRetryTime) {
-        wifiClientConnect();
+        if((WiFi.getStatusBits() & STA_CONNECTED_BIT) && _slaacGraceCount < 3) {
+          // Associated at L2 but no usable address yet. On IPv6-only networks
+          // SLAAC takes ~9-17s from WiFi.begin() — longer than the 10s retry —
+          // so tearing down the association here guarantees the device never
+          // completes address acquisition (observed live). Grant up to 3 grace
+          // periods (~30s associated) before forcing a re-association.
+          _slaacGraceCount++;
+          _clientRetryTime = millis() + WIFI_CLIENT_RETRY_TIMEOUT;
+          DEBUG.printf("WiFi associated, no address yet — SLAAC grace %d/3\r\n",
+                       _slaacGraceCount);
+          if (!_wifiIpv6Enabled) {
+            // enableIpV6 lost the netif-up race at STA_CONNECTED — without it
+            // no SLAAC can happen, so the grace would be wasted waiting for an
+            // address that can never arrive. The netif is certainly up by now
+            // (we have been associated for >= one retry period): retry here
+            // instead of burning all 3 graces and re-associating (observed to
+            // cost ~75s of race roulette on a v6-only network).
+            _wifiIpv6Enabled = WiFi.enableIpV6();
+            DEBUG.printf("WiFi enableIpV6 (grace retry): %s\r\n",
+                         _wifiIpv6Enabled ? "OK" : "FAILED");
+          }
+        } else {
+          _slaacGraceCount = 0;
+          wifiClientConnect();
+        }
       }
 
       delayTime = _clientRetryTime - millis();
@@ -1013,7 +1063,14 @@ bool NetManagerTask::isConnected()
 
 bool NetManagerTask::isWifiClientConnected()
 {
-  return WiFi.isConnected() && isWifiModeSta();
+  // WiFi.isConnected() is status()==WL_CONNECTED, which the Arduino core sets
+  // ONLY on IPv4 GOT_IP (WiFiGeneric.cpp:1105) — GOT_IP6 sets status bits but
+  // never WL_CONNECTED. On an IPv6-only network (no DHCPv4) that gate stays
+  // false forever, so also accept a routable IPv6 global address as connected.
+  // _ipv6address_global_wifi is cleared on STA disconnect (onGlobalIPv6Lost),
+  // so a non-empty value implies a live association.
+  return (WiFi.isConnected() || _ipv6address_global_wifi.length() > 0)
+         && isWifiModeSta();
 }
 
 bool NetManagerTask::isWiredConnected()

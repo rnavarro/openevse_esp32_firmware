@@ -1145,7 +1145,19 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
   reverted to previous firmware. OTA safety net confirmed working.
 - [ ] No memory leaks or crashes over 1+ week runtime
 - [x] IPv4-mapped addresses display as `a.b.c.d` not `::ffff:a.b.c.d` in debug logs — **non-issue confirmed**: Mongoose `inet_ntoa()` calls operate on `nc->sa.sin.sin_addr` (IPv4-only struct, can't produce `::ffff:` output). Application-layer IPv6 display uses LwIP's `ip6addr_ntoa()` which produces proper `2001:db8::1` notation. DNS-level IPv4-mapped filtering in `mqtt.cpp` two-step `getaddrinfo()` prevents `::ffff:` from ever reaching the connect path.
-- [ ] IPv6-only network test: disable IPv4, verify EVSE still functions
+- [x] IPv6-only network test — **PASSED 2026-06-05** after implementing the GAP 3 fix
+  (commit 30813e4). On WLAN_IOT (SLAAC+RDNSS, no DHCPv4): boot → MQTT-over-IPv6 in
+  24s, web server reachable over routed v6, mDNS advertising, OTA update performed
+  over the v6-only path, `ipaddress` correctly empty in /status. Fix is three changes
+  in net_manager (see GAP 3 section): isWifiClientConnected() accepts a routable v6
+  global; handleGotIPv6() enters Connected state when v4 never arrives; SLAAC grace
+  (3×10s) in the retry state machine stops the association-teardown churn, with an
+  in-grace enableIpV6 retry when the netif-up race was lost. Dual-stack regression
+  verified: WLAN_2G boot timeline unchanged, IPv4 wins the race, no graces trigger.
+  Remaining v6-only caveats (acceptable): NTP via SNTP needs an AAAA-bearing pool
+  hostname (pool.ntp.org has no AAAA; 2.pool.ntp.org does — config change, not code);
+  MQTT announce URL uses empty `net.getIp()`; EmonCMS/OCPP function but only tested
+  on dual-stack.
 - [ ] Address change resilience — **deferred, low priority**. EUI-64 SLAAC on a stable
   home prefix means mid-session address changes are rare. Existing TCP connections
   survive address deprecation (RFC 4862) and only break on flash renumbering
