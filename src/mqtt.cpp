@@ -247,9 +247,13 @@ void Mqtt::attemptConnection() {
     }
   } else {
     // Server is a hostname — resolve via DNS.
-    // Use cached result if fresh (within TTL) and address family unchanged.
+    // Use cached result if fresh (within TTL), for the SAME hostname, and
+    // address family unchanged. The hostname check invalidates the cache
+    // when mqtt_server config changes — without it, a broker hostname change
+    // would connect to the old broker's IP for up to the TTL.
     unsigned long now = millis();
     bool cache_valid = (_resolvedHost.length() > 0) &&
+                       (_resolvedFor == mqtt_server) &&
                        ((long)(now - _resolvedAt) >= 0) &&
                        ((long)(now - _resolvedAt) < (long)DNS_CACHE_TTL_MS);
 
@@ -293,6 +297,7 @@ void Mqtt::attemptConnection() {
             resolved_ipv6 = true;
             _resolvedHost = String(addrstr);
             _resolvedIsIPv6 = true;
+            _resolvedFor = mqtt_server;
             _resolvedAt = now;
           }
           if (!resolved_ipv6) {
@@ -321,6 +326,7 @@ void Mqtt::attemptConnection() {
           // Cache the result
           _resolvedHost = String(addrstr);
           _resolvedIsIPv6 = false;
+          _resolvedFor = mqtt_server;
           _resolvedAt = now;
           freeaddrinfo(result);
         } else {

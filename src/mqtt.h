@@ -52,6 +52,7 @@ class Mqtt : public MicroTasks::Task {
     // DNS resolution cache: avoid blocking getaddrinfo() on every reconnect.
     // Cached result is used if fresh (within TTL); re-resolved otherwise.
     String _resolvedHost;                         // Resolved address string (IP literal)
+    String _resolvedFor;                          // Hostname this cache entry resolved (invalidates on mqtt_server change)
     bool _resolvedIsIPv6 = false;                 // Was the resolved address IPv6?
     unsigned long _resolvedAt = 0;                 // millis() when resolved
     static constexpr unsigned long DNS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min TTL
