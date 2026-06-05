@@ -1243,12 +1243,36 @@ comparing their proven coverage against ours:
        potentially escalating to AP fallback via `_clientDisconnects`
      - Only the web server works (Mongoose listener starts at boot,
        connection-state-independent) — reachable over v6 but the device is otherwise dead
-  3. **Fix sketch (for the IPv6-only phase):** treat a global IPv6 acquisition as
+  3. **EMPIRICALLY CONFIRMED 2026-06-05 — live-fire test on WLAN_IOT (v6-only SSID,
+     prefix `2602:80f:c004:8::/64`):** every code-review prediction reproduced, plus
+     sharper detail:
+     - Association + link-local: OK. SLAAC global acquired ~9s after association
+       (`2602:80f:c004:8:b68a:aff:fe75:c104`) — when given a long enough window.
+     - **Churn is worse than predicted:** `WIFI_CLIENT_RETRY_TIMEOUT` (~10s) re-fires
+       `wifiClientConnect()` → `WiFi.begin()` tears down the L2 association ~2s AFTER
+       the global address lands. Most cycles never even reach STA_CONNECTED. The device
+       holds a usable address for seconds at a time.
+     - Web server unreachable in practice — not because of the listener (boot-time,
+       fine) but because L2 churn kills connections. Recovery required hammering a
+       config POST in a loop until one landed in a ~3s association window.
+     - AP fallback escalation confirmed: `_clientDisconnects` crossed threshold ~60s in
+       → AP+STA mode (`AP IP Address: 192.168.4.1`) while STA kept churning. The AP +
+       captive portal is the practical field recovery path.
+     - Bonus: `enableIpV6 (STA_CONNECTED): FAILED` observed again mid-churn — the
+       netif-up race isn't cold-boot-exclusive; rapid reconnect cycles also lose it.
+       The GOT_IP retry doesn't help on v6-only (GOT_IP never fires) — the IPv6-only
+       fix must also retry enableIpV6 from a v6-aware path.
+     - Verdict: v6-only is NOT functional in v0, exactly as scoped. Restored to
+       WLAN_2G via recovery hammer + GET /restart; full dual-stack recovery in ~7s.
+  4. **Fix sketch (for the IPv6-only phase):** treat a global IPv6 acquisition as
      network-up — in `handleGotIPv6()`, if global/ULA and `_state != Connected`, run a
      v6-aware variant of `haveNetworkConnection()`; and make `isWifiClientConnected()`
      accept `STA_HAS_IP6_BIT` (via `WiFiGenericClass::getStatusBits()`) as an
      alternative to WL_CONNECTED. Must not regress dual-stack: on v4+v6 networks the
-     IPv4 path usually wins the race and nothing changes.
+     IPv4 path usually wins the race and nothing changes. Per the live test, the fix
+     must ALSO: (a) stop the `StationClientConnecting` retry timer once associated
+     with IPv6 (the churn killer), and (b) include an enableIpV6 retry reachable
+     without GOT_IP (e.g., on a timer or at GOT_IP6 link-local).
 
 - [x] **GAP 4 — Soak instrumentation — DEPLOYED 2026-06-05.**
   `~/.local/bin/openevse-soak-poll` (on rnavarro-ryzen) polls `/status` every 5 min via
@@ -1677,11 +1701,27 @@ If RS #1 were answered, IPv6 global would be ~T+8s and MQTT on IPv6 by ~T+8.5s.
 
 **How to capture timestamped serial output (relative T+0 from first byte):**
 ```bash
-sudo picocom -b 115200 /dev/ttyUSB2 --quiet | ts -s '[%H:%M:%.S]'
+sudo picocom -b 115200 /dev/ttyUSB2 --quiet | ts -s '[%H:%M:%.S]' | stdbuf -oL tee /tmp/openevse-serial.log
 # requires: sudo apt install moreutils
 # T=0 = first byte from serial (boot ROM or running firmware, whichever comes first)
 # Reset the device after starting picocom to get clean T=0 from boot ROM
+# tee to a file so tooling/agents can tail the log while you watch live
 ```
+
+**How to restart the device remotely (web_server.cpp `handleRestart`):**
+```bash
+# GET restarts the gateway unconditionally (returns "1" on success):
+curl "http://<host>/restart"
+
+# POST requires a JSON body naming the device — a bare POST hits a
+# deserialize error and silently does NOTHING (no response, curl times out):
+curl -X POST "http://<host>/restart" -H "Content-Type: application/json" \
+  -d '{"device":"gateway"}'        # or {"device":"evse"} for the safety MCU
+```
+Gotcha (cost us a confused test cycle): `curl -X POST /restart` with no body
+looks plausible, returns nothing, and does not restart. Use GET, or POST with
+the `device` key. Also note SSID config changes require a restart to apply —
+`wifiRestartTime` in web_server.cpp is checked but never set (upstream quirk).
 
 **Why RS #1 gets no RA response (open question):**
 Packet analysis shows RS #1 goes out at T+3.5s (boot), RS #2 at T+7.5s. Only RS #2
