@@ -45,6 +45,7 @@ class Mqtt : public MicroTasks::Task {
     uint8_t _ipv6FailCount = 0;                  // Consecutive IPv6 connect failures
     unsigned long _ipv6SuppressedUntil = 0;        // millis() timestamp: skip AAAA until this time
     bool _lastAttemptWasIPv6 = false;              // Did the last attempt resolve to IPv6?
+    bool _sessionEstablished = false;              // CONNACK received for current session (gates IPv6 fail counting)
     bool _connectedViaIPv6 = false;               // Is the current connection over IPv6?
     static constexpr uint8_t IPV6_FAIL_THRESHOLD = 2;   // Failures before suppression
     static constexpr unsigned long IPV6_SUPPRESS_MS = 10 * 60 * 1000; // 10 min cooldown
@@ -57,6 +58,7 @@ class Mqtt : public MicroTasks::Task {
     unsigned long _resolvedAt = 0;                 // millis() when resolved
     static constexpr unsigned long DNS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min TTL
     bool _pendingRestartForIPv6 = false;          // Delayed restart waiting for disconnect
+    bool _pendingIPv6AddressChanged = false;      // Deferred restart was for an address CHANGE (not v4->v6 upgrade)
 
     // EventListener for IPv6 global address changes from net_manager.
     // MQTT decides its own upgrade policy: only reconnect if currently on IPv4.

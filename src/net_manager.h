@@ -235,21 +235,20 @@ class NetManagerTask : public MicroTasks::Task
     String getIp() {
       return _ipaddress;
     }
-    String getIpv6Global() {
-      // Return the "best" global IPv6 address: prefer WiFi STA, then ETH.
-      // Most deployments use one interface at a time (when ETH comes up,
-      // WiFi is stopped; when ETH goes down, WiFi starts). The rare case
-      // of both active simultaneously is handled by preferring WiFi since
-      // the device is in STA+AP mode and the WiFi address is reachable
-      // from the LAN. For the common single-interface case, there is no
-      // ambiguity.
-      if (_ipv6address_global_wifi.length() > 0) return _ipv6address_global_wifi;
-#ifdef ENABLE_WIRED_ETHERNET
-      return _ipv6address_global_eth;
-#else
-      return "";
-#endif
-    }
+    // Preferred routable IPv6 (GUA > ULA) for one interface, derived from
+    // LIVE LwIP state at call time — never stale, unlike the event-written
+    // Strings (invalidation is silent; a later ULA event would otherwise
+    // clobber the GUA). Defined in net_manager.cpp.
+    String livePreferredGlobal(const char *ifkey);
+
+    // Full per-slot dump of the LwIP IPv6 address table (state + lifetimes)
+    // for one interface. Backs both the GOT_IP6 serial log and /debug/ipv6.
+    String dumpIpv6Table(const char *ifkey);
+
+    // Best routable IPv6 address: prefer WiFi STA, then ETH (in STA+AP
+    // fallback the WiFi address is the reachable one). Live LwIP state.
+    // Defined in net_manager.cpp.
+    String getIpv6Global();
     String getIpv6LinkLocal() {
       if (_ipv6address_linklocal_wifi.length() > 0) return _ipv6address_linklocal_wifi;
 #ifdef ENABLE_WIRED_ETHERNET
@@ -262,11 +261,7 @@ class NetManagerTask : public MicroTasks::Task
       return _macaddress;
     }
     bool hasGlobalIPv6() {
-      return _ipv6address_global_wifi.length() > 0
-#ifdef ENABLE_WIRED_ETHERNET
-             || _ipv6address_global_eth.length() > 0
-#endif
-             ;
+      return getIpv6Global().length() > 0;
     }
     void onIPv6GlobalChanged(MicroTasks::EventListener *listener) {
       _ipv6GlobalChanged.Register(listener);

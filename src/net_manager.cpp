@@ -8,6 +8,7 @@
 #include "espal.h"
 #include "time_man.h"
 #include "event.h"
+#include "ipv6_select.h"
 
 #include "LedManagerTask.h"
 
@@ -262,31 +263,135 @@ void NetManagerTask::haveNetworkConnection(IPAddress myAddress)
   _state = NetState::Connected;
 }
 
+String NetManagerTask::livePreferredGlobal(const char *ifkey)
+{
+  // Derive the preferred routable IPv6 address from LIVE LwIP state.
+  // Event-written Strings go stale two ways (both observed in RA-injection
+  // testing 2026-06-05): a later GOT_IP6 for a ULA overwrites a GUA
+  // (last-writer-wins, no preference), and address invalidation is SILENT
+  // (no LOST_IP6 event exists) so a dead address stays in the String
+  // forever. Reading the interface at query time fixes both.
+  //
+  // This answers "what address do we advertise for inbound reachability"
+  // (mDNS AAAA, /status display) — NOT RFC 6724 source selection, which
+  // lwIP already runs per-socket for outbound. So scope dominates and
+  // preferred-vs-deprecated is the intra-scope tiebreak:
+  //   preferred-GUA > deprecated-GUA > preferred-ULA > deprecated-ULA
+  // The intra-GUA tiebreak is what makes renumbering work: the old prefix
+  // goes deprecated-but-valid (grace window) while the new one is
+  // preferred — without the tiebreak we could stay pinned to the dying
+  // address and change detection would never fire. Link-local never
+  // returned. Reads the lwIP netif directly because esp_netif_get_all_ip6
+  // discards the per-slot state we need.
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifkey);
+  if (!netif) return "";
+  struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(netif);
+  if (!lwip_nif) return "";
+  // Translate live lwIP per-slot state into POD and rank with the shared,
+  // host-tested selector (ipv6_select.h). Same operator the unit test asserts.
+  Ipv6SlotInfo slots[LWIP_IPV6_NUM_ADDRESSES];
+  for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
+    u8_t state = netif_ip6_addr_state(lwip_nif, i);
+    const ip6_addr_t *a = ip_2_ip6(&lwip_nif->ip6_addr[i]);
+    slots[i].valid       = ip6_addr_isvalid(state);
+    slots[i].isAny       = ip6_addr_isany(a);
+    slots[i].isLinkLocal = ip6_addr_islinklocal(a);
+    slots[i].isGlobal    = ip6_addr_isglobal(a);
+    slots[i].isPreferred = ip6_addr_ispreferred(state);
+  }
+  int best = ipv6SelectAdvertisedSlot(slots, LWIP_IPV6_NUM_ADDRESSES);
+  if (best < 0) return "";
+  return IPv6Address(ip_2_ip6(&lwip_nif->ip6_addr[best])->addr).toString();
+}
+
+String NetManagerTask::dumpIpv6Table(const char *ifkey)
+{
+  // Full per-slot snapshot of the LwIP IPv6 address table for one interface.
+  // The GOT_IP6 log line only fires on events, so "nothing logged" is
+  // ambiguous (RA not received / PIO rejected / address deprecated / slot
+  // exhausted). This dumps every slot with its state and lifetimes so the
+  // ambiguity collapses to a single readable snapshot. Returns the text so
+  // the same body backs both the serial log and a /debug endpoint.
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifkey);
+  if (!netif) return String("v6 table ") + ifkey + ": (no netif)\r\n";
+  struct netif *nif = (struct netif *)esp_netif_get_netif_impl(netif);
+  if (!nif) return String("v6 table ") + ifkey + ": (no lwip netif)\r\n";
+  String out = String("v6 table ") + ifkey + ":\r\n";
+  for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
+    u8_t st = netif_ip6_addr_state(nif, i);
+    const ip6_addr_t *a = ip_2_ip6(&nif->ip6_addr[i]);
+    const char *s = ip6_addr_isinvalid(st)   ? "INVALID"   :
+                    ip6_addr_istentative(st)  ? "TENTATIVE" :
+                    ip6_addr_ispreferred(st)  ? "PREFERRED" :
+                    ip6_addr_isdeprecated(st) ? "DEPRECATED": "?";
+    const char *scope = ip6_addr_islinklocal(a) ? "LL"  :
+                        ip6_addr_isglobal(a)    ? "GUA" :
+                        ip6_addr_isany(a)       ? "-"   : "ULA";
+    char line[120];
+    snprintf(line, sizeof(line), "  v6[%d] %-39s %-10s %-3s valid=%lu pref=%lu\r\n",
+             i, ip6addr_ntoa(a), s, scope,
+             (unsigned long)nif->ip6_addr_valid_life[i],
+             (unsigned long)nif->ip6_addr_pref_life[i]);
+    out += line;
+  }
+  return out;
+}
+
+String NetManagerTask::getIpv6Global()
+{
+  // Live LwIP state; WiFi preferred over ETH (see header comment history:
+  // in STA+AP fallback the WiFi address is the reachable one).
+  String g = livePreferredGlobal("WIFI_STA_DEF");
+  if (g.length() > 0) return g;
+#ifdef ENABLE_WIRED_ETHERNET
+  return livePreferredGlobal("ETH_DEF");
+#else
+  return "";
+#endif
+}
+
 void NetManagerTask::onGlobalIPv6Acquired(const char *ifkey)
 {
-  // mDNS AAAA workaround: swap global address into LwIP slot 0 so
-  // the precompiled mDNS library (which only reads slot 0) advertises
-  // the global address instead of the link-local.
+  // mDNS AAAA workaround: move the preferred routable address into LwIP
+  // slot 0 so the precompiled mDNS library (which only reads slot 0)
+  // advertises it. Generalized from the original "slot0 is link-local"
+  // case: after renumbering, slot 0 may hold a deprecated old global
+  // while the new one sits in a higher slot — rank with the SAME score
+  // as livePreferredGlobal() (preferred-GUA > deprecated-GUA >
+  // preferred-ULA > deprecated-ULA) so the AAAA we advertise always
+  // matches the address /status reports, and swap the winner into slot 0.
   esp_netif_t *swap_netif = esp_netif_get_handle_from_ifkey(ifkey);
   if (swap_netif) {
     struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
-    if (lwip_nif &&
-        ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[0])) &&
-        !ip6_addr_isany(ip_2_ip6(&lwip_nif->ip6_addr[1])) &&
-        !ip6_addr_islinklocal(ip_2_ip6(&lwip_nif->ip6_addr[1]))) {
-      ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
-      lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[1];
-      lwip_nif->ip6_addr[1] = tmp_addr;
-      u8_t tmp_state = lwip_nif->ip6_addr_state[0];
-      lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[1];
-      lwip_nif->ip6_addr_state[1] = tmp_state;
-      u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
-      lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[1];
-      lwip_nif->ip6_addr_valid_life[1] = tmp_valid;
-      u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
-      lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[1];
-      lwip_nif->ip6_addr_pref_life[1] = tmp_pref;
-      DEBUG.printf("mDNS: swapped global IPv6 into slot 0 on %s\r\n", ifkey);
+    if (lwip_nif) {
+      // Same shared selector as livePreferredGlobal(): the AAAA we advertise
+      // must match the address /status reports.
+      Ipv6SlotInfo slots[LWIP_IPV6_NUM_ADDRESSES];
+      for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
+        u8_t state = netif_ip6_addr_state(lwip_nif, i);
+        const ip6_addr_t *a = ip_2_ip6(&lwip_nif->ip6_addr[i]);
+        slots[i].valid       = ip6_addr_isvalid(state);
+        slots[i].isAny       = ip6_addr_isany(a);
+        slots[i].isLinkLocal = ip6_addr_islinklocal(a);
+        slots[i].isGlobal    = ip6_addr_isglobal(a);
+        slots[i].isPreferred = ip6_addr_ispreferred(state);
+      }
+      int best = ipv6SelectAdvertisedSlot(slots, LWIP_IPV6_NUM_ADDRESSES);
+      if (best > 0) {
+        ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
+        lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[best];
+        lwip_nif->ip6_addr[best] = tmp_addr;
+        u8_t tmp_state = lwip_nif->ip6_addr_state[0];
+        lwip_nif->ip6_addr_state[0] = lwip_nif->ip6_addr_state[best];
+        lwip_nif->ip6_addr_state[best] = tmp_state;
+        u32_t tmp_valid = lwip_nif->ip6_addr_valid_life[0];
+        lwip_nif->ip6_addr_valid_life[0] = lwip_nif->ip6_addr_valid_life[best];
+        lwip_nif->ip6_addr_valid_life[best] = tmp_valid;
+        u32_t tmp_pref = lwip_nif->ip6_addr_pref_life[0];
+        lwip_nif->ip6_addr_pref_life[0] = lwip_nif->ip6_addr_pref_life[best];
+        lwip_nif->ip6_addr_pref_life[best] = tmp_pref;
+        DEBUG.printf("mDNS: swapped preferred IPv6 into slot 0 (from slot %d) on %s\r\n", best, ifkey);
+      }
     }
   }
 
@@ -341,12 +446,27 @@ void NetManagerTask::handleGotIPv6(esp_ip6_addr_t &addr, const char *ifkey, cons
     {
       global_field = &_ipv6address_global_wifi;
     }
-    bool had_global = global_field && global_field->length() > 0;
-    if (global_field) *global_field = addr_str;
+    // Change detection on the PREFERRED routable address (GUA > ULA, from
+    // live LwIP state) rather than the raw event address. This means:
+    //  - a test/extra ULA arriving alongside a GUA is a no-op (preferred
+    //    unchanged) — no mDNS churn, no service restarts
+    //  - the periodic RA-refresh GOT_IP6 for the same address is a no-op
+    //    (this is what the old had_global guard protected against)
+    //  - a genuine renumbering (new preferred address) re-runs the mDNS
+    //    slot swap and fires the change event so services (MQTT) can
+    //    reconnect from the new source address proactively
+    String preferred = livePreferredGlobal(ifkey);
+    if (preferred.length() == 0) preferred = addr_str;
+    bool changed = global_field && (*global_field != preferred);
+    if (global_field) *global_field = preferred;
     DEBUG.printf("Connected, %s IPv6 global: %s\r\n", label, addr_str.c_str());
-    if (!had_global) {
+    if (preferred != addr_str) {
+      DEBUG.printf("%s preferred IPv6 global remains: %s\r\n", label, preferred.c_str());
+    }
+    if (changed) {
       onGlobalIPv6Acquired(ifkey);
     }
+    DEBUG.print(dumpIpv6Table(ifkey).c_str());
 
     // IPv6-only network support: a routable IPv6 address means the network is
     // usable even if DHCPv4 never answers. Without this, _state never leaves
@@ -1066,10 +1186,12 @@ bool NetManagerTask::isWifiClientConnected()
   // WiFi.isConnected() is status()==WL_CONNECTED, which the Arduino core sets
   // ONLY on IPv4 GOT_IP (WiFiGeneric.cpp:1105) — GOT_IP6 sets status bits but
   // never WL_CONNECTED. On an IPv6-only network (no DHCPv4) that gate stays
-  // false forever, so also accept a routable IPv6 global address as connected.
-  // _ipv6address_global_wifi is cleared on STA disconnect (onGlobalIPv6Lost),
-  // so a non-empty value implies a live association.
-  return (WiFi.isConnected() || _ipv6address_global_wifi.length() > 0)
+  // false forever, so also accept a routable IPv6 address as connected.
+  // Live LwIP state (not the event-written String): address invalidation is
+  // silent (no LOST_IP6 event), so a cached String would report connected
+  // forever on a dead v6-only network — live state lets the retry/grace
+  // machinery notice and re-associate.
+  return (WiFi.isConnected() || livePreferredGlobal("WIFI_STA_DEF").length() > 0)
          && isWifiModeSta();
 }
 

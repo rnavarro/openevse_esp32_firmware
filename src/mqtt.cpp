@@ -114,6 +114,8 @@ unsigned long Mqtt::loop(MicroTasks::WakeReason reason) {
   // that we're idle, proceed with the upgrade.
   if (_pendingRestartForIPv6 && !_connecting) {
     _pendingRestartForIPv6 = false;
+    bool wasAddressChange = _pendingIPv6AddressChanged;
+    _pendingIPv6AddressChanged = false;
     // Cancel if IPv6 was lost between the event and the deferred restart.
     // A missing global address means the network changed and the upgrade
     // would needlessly tear down a working IPv4 connection.
@@ -122,38 +124,45 @@ unsigned long Mqtt::loop(MicroTasks::WakeReason reason) {
     } else if (_mqttclient.connected() && !isConnectedViaIPv6()) {
       DBUGLN("MQTT: deferred IPv6 upgrade proceeding");
       restartConnection();
+    } else if (_mqttclient.connected() && wasAddressChange) {
+      // Deferred because the preferred global CHANGED while a connect was in
+      // flight — that connect completed using the old source address.
+      DBUGLN("MQTT: deferred reconnect for changed IPv6 address proceeding");
+      restartConnection();
     } else if (!_mqttclient.connected()) {
       DBUGLN("MQTT: deferred IPv6 upgrade — not connected, allowing immediate reconnect");
       _nextMqttReconnectAttempt = 0;
     }
   }
 
-  // IPv6 global address transition: upgrade to IPv6 if currently on IPv4.
-  // This is MQTT's own policy — net_manager fires the event, each service
-  // decides what to do. Re-check hasGlobalIPv6() because the state may
-  // have changed between trigger and this loop iteration.
-  //
-  // Handles three states:
-  //  - Connected over IPv4: teardown and reconnect with fresh AAAA-first resolve
-  //  - Mid-connect over IPv4: defer upgrade until current connect completes
-  //  - Disconnected: next reconnect attempt will do fresh resolve
-  if (_ipv6GlobalListener.IsTriggered() && net.hasGlobalIPv6()
-      && !isConnectedViaIPv6()) {
-    // Invalidate DNS cache so attemptConnection() does a fresh AAAA-first
-    // resolve instead of reusing the stale IPv4 cached result.
-    // Also reset IPv6 suppression — a fresh global address is a strong
-    // signal that the network changed and IPv6 deserves another chance.
+  // IPv6 global address event. net_manager fires this ONLY when the
+  // preferred routable address actually changes (change detection on live
+  // LwIP state, GUA > ULA) — same-address RA refreshes and extra-prefix
+  // additions don't fire. Two cases:
+  //  - Not on IPv6 yet (first acquisition / on IPv4): upgrade to IPv6
+  //  - Already on IPv6: the preferred address CHANGED (renumbering) — our
+  //    connection's source address is deprecated or gone; reconnect from
+  //    the new address proactively instead of waiting ~90s for keepalive
+  //    death (RA-injection characterization 2026-06-05)
+  if (_ipv6GlobalListener.IsTriggered() && net.hasGlobalIPv6()) {
+    // Invalidate DNS cache for a fresh AAAA-first resolve, and reset IPv6
+    // suppression — a fresh/changed global address is a strong signal the
+    // network changed and IPv6 deserves another chance.
     _resolvedHost = "";
     _resolvedAt = 0;
     _resolvedIsIPv6 = false;
     _ipv6FailCount = 0;
     _ipv6SuppressedUntil = 0;
     if (isConnected()) {
-      DEBUG.printf("MQTT: upgrading connection to IPv6\r\n");
+      DEBUG.printf("MQTT: %s\r\n", isConnectedViaIPv6()
+                   ? "IPv6 address changed, reconnecting"
+                   : "upgrading connection to IPv6");
       restartConnection();
     } else if (_connecting) {
-      DEBUG.printf("MQTT: deferring IPv6 upgrade until current connect completes\r\n");
+      DEBUG.printf("MQTT: deferring IPv6 %s until current connect completes\r\n",
+                   isConnectedViaIPv6() ? "reconnect" : "upgrade");
       _pendingRestartForIPv6 = true;
+      _pendingIPv6AddressChanged = true;
     } else {
       // Not connected and not connecting — next attempt will resolve fresh
       _nextMqttReconnectAttempt = 0;
@@ -390,6 +399,7 @@ void Mqtt::attemptConnection() {
 void Mqtt::onMqttConnect() {
   DBUGLN("MQTT connected");
   _connecting = false;
+  _sessionEstablished = true;
   _nextMqttReconnectAttempt = 0; // Reset reconnect timer
 
 #if MG_ENABLE_IPV6
@@ -424,12 +434,18 @@ void Mqtt::onMqttConnect() {
 void Mqtt::onMqttDisconnect(int err, const char *reason) {
   DBUGLN("MQTT disconnected");
   _connecting = false;
+  bool sessionWasEstablished = _sessionEstablished;
+  _sessionEstablished = false;
   // _nextMqttReconnectAttempt is handled by the main loop to retry.
 
 #if MG_ENABLE_IPV6
-  // Track IPv6 connection failures. If IPv6 fails repeatedly,
-  // suppress AAAA queries for a cooldown to fall back to IPv4.
-  if (_lastAttemptWasIPv6) {
+  // Track IPv6 CONNECT failures — only attempts that died before CONNACK.
+  // An established session ending (broker restart, deliberate
+  // restartConnection() for an address change, network handoff) is not a
+  // connect failure; counting those poisoned the suppression counter
+  // (observed: a deliberate change-reconnect logged "failure #1").
+  // If IPv6 connects fail repeatedly, suppress AAAA for a cooldown.
+  if (_lastAttemptWasIPv6 && !sessionWasEstablished) {
     _ipv6FailCount++;
     DEBUG.printf("MQTT: IPv6 connect failure #%u\r\n", _ipv6FailCount);
     if (_ipv6FailCount >= IPV6_FAIL_THRESHOLD) {
