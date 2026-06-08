@@ -1290,6 +1290,24 @@ The clean long-term path is not "rebuild the libs" or "fork the framework" — i
 
 The cost is the migration itself: the v4.4→v5.x API churn flagged in both this plan and the IoTaWatt cross-review (`esp_littlefs`, `esp32-camera`, mDNS API variation, etc.). That is weeks of work, not an afternoon — but it is *normal upstream-track work*, independently valuable to OpenEVSE (security, support, modern toolchain), and it is what makes a good IPv6 implementation possible at all. **The framework bump is a better, more welcome contribution than the IPv6 code would have been on its own.**
 
+**Two important caveats (added 2026-06-08, after surveying the upstream landscape):**
+
+1. **This is hypothetical/future, not near-term.** No core-3.x migration is on the maintainers' actual roadmap (see landscape below). For the foreseeable next release, OpenEVSE stays on **core-2.x / IDF4** — so the `liblwip` RDNSS rebuild and the mDNS slot-0 swap **remain necessary**, and the loopTask-watchdog fix remains load-bearing. "v5.x deletes the hacks" describes a future that nobody upstream has committed to.
+2. **A bump can't be wholesale — 4MB boards stay on core-2 permanently.** The one (external, unmerged) modernization proposal that exists upstream is explicitly a *two-core coexistence* design, because **4MB-flash boards must stay on `espressif32@6.12.0` / IDF4 to keep the dual-slot OTA image small enough**; only 16MB+ silicon can move to core-3.x. This is a real hardware constraint regardless of who proposed it.
+
+   **Resolved (2026-06-08) — our deployment targets are 16MB, the dev board is the 4MB outlier.** Flash size is reported by the `/config` endpoint as `espflash` (`ESPAL.getFlashChipSize()`; *not* in `/status`, which only carries `free_heap`/`freeram`). Measured live:
+
+   | Device | buildenv | espflash |
+   |--------|----------|----------|
+   | Olimex ESP32-Gateway (bench/dev, `172.16.5.176`) | `olimex_esp32-gateway-f` | **4 MB** (4194304) |
+   | `openevse-single` (`172.16.5.113`) | `openevse_wifi_v1` | **16 MB** (16777216) |
+   | `openevse-double` (`172.16.5.187`) | `openevse_wifi_v1` | **16 MB** (16777216) |
+
+   Implications:
+   - The **production chargers are 16MB → core-3.x-eligible.** So the "v5.x deletes the hacks" path (native RDNSS, native mDNS global AAAA, no slot-0 swap) genuinely applies to the real deployment targets if/when a core-3 migration lands — it is not merely hypothetical for them. Only the **4MB Olimex bench unit** is stuck on core-2/IDF4, where the current hacks remain mandatory.
+   - The **~110KB-headroom / 94%-flash-usage concern documented elsewhere in this plan is a 4MB-board artifact.** The 16MB `openevse_wifi_v1` chargers have a far larger app partition and ample room for the IPv6 additions.
+   - **Validation caveat:** the IPv6 work has been validated on the 4MB Olimex but will deploy on 16MB `openevse_wifi_v1`. Same core-2/IDF4 firmware approach today (so the logic carries), but the dev board is not representative on flash headroom or on future framework eligibility.
+
 ### Dependency order
 
 - The hard dependency that must land first is **`ArduinoMongoose`**: this firmware depends on `rnavarro/ArduinoMongoose#fix/ipv6-dual-stack` (the `TEMP` line in `platformio.ini`). A clean OpenEVSE PR cannot reference a fork branch; the IPv6 dual-stack patches must land in `jeremypoulter/ArduinoMongoose` (or a tagged release) first.
@@ -1302,6 +1320,11 @@ The cost is the migration itself: the v4.4→v5.x API churn flagged in both this
 - **Existing IPv6 effort — PR #1038** ("Add IPv6 support for WiFi and Ethernet interfaces", branch `copilot/add-ipv6-support`): a **28-line Copilot-bot stub**, opened and abandoned 2026-02-14, no framework bump. It only calls `enableIpV6()` and surfaces `WiFi.localIPv6()` — which on stock v2.0.x is the **link-local** address, i.e. it reports something unreachable from off-link. It is not a serious implementation; the field is effectively open. Not worth fighting.
 - **Active overlap — PR #1087 / #1088** (Chris Howell's `Net_Fixes`): a 32-file overhaul fixing WiFi reconnect-after-brownout (issue #1004), MQTT reconnect hang, and NTP boot-sync (#1003), touching `mqtt.cpp`/`net_manager.cpp`/`time_man.*` — our files. It **was merged then reverted the same day** (2026-06-04) after regressions (NTP sync / Mongoose `_nc` timing / a watchdog change). So `master` currently has neither those fixes nor ours; #1003/#1004 are effectively still open.
   - **Relationship to our work:** complementary, not the same. Their watchdog is a "connection died without a disconnect event → reconnect" watchdog plus an MQTT connect-timeout rework; ours is a *task*-watchdog exemption around a blocking `getaddrinfo()`. Different root causes; neither solves the other's bug. **Caveat:** both touch the `_connecting`/connect-timeout logic in `mqtt.cpp`, so our changes must reconcile with whatever shape theirs lands in. **Limiter:** our watchdog fix guards the `#if MG_ENABLE_IPV6` cold-resolve path, which does not exist on stock (IPv4-only) upstream — so it is not a drop-in gift to their IPv4 reconnect problem; the overlap is the subsystem and the methodology, not the literal patch.
+- **A core-3.x modernization proposal exists, but it is NOT the project's direction — verified, do not anchor on it.** An external party (`RAR` / Andrew Rankin) has opened **#1090 `feature/esp32-modernization`** (132-commit WIP draft, explicitly "not for merge": core-3 migration + P4 + HA + tsdb) and **#1091 `feature/core3-two-core-build`** (the ready two-core build foundation). It is tempting to read these as "the framework bump is already happening upstream." It is not:
+  - **No standing.** RAR has `author_association = NONE` on every PR, **zero merged PRs**, and is **not** an OpenEVSE org member. These are over-the-wall submissions, not a maintainer's roadmap.
+  - **Invisible to the community.** A full-text search of the OpenEVSE Discord mirror (~3,970 messages across 17 channels, synced 2026-06-08) found **zero** references to "Validic", "Andrew Rankin", "RAR", "core-3", "pioarduino", "IDF5", or "modernization" — no messages by him, none about him, no maintainer acknowledgement. The migration effort is not discussed anywhere upstream.
+  - **Useful artifact:** the *technical* two-core / 4MB-OTA constraint documented in #1091 is real and worth heeding (see "The real unlock" caveats), independent of the PR's fate.
+- **The maintainers' actual next-release roadmap** (Chris Howell, OpenEVSE Discord, 2026-06-07): the safety-firmware false-no-ground fix, a clear-counters command, a UI refresh with dark/light themes, and power/temperature graphs with day/month/year charts. **No toolchain modernization, no IPv6.** Implication for us: the next release is mostly **GUI + safety-MCU** work — largely orthogonal to our IPv6 *networking* changes. The real collision surface on a future rebase is the `web_static` gz blobs / `gui-v2`, plus Chris's reconnect work in `mqtt.cpp`/`net_manager.cpp` (NTP_Fixes #1089, his post-revert re-attempt), not the IPv6 logic itself.
 
 ### Lessons that shape the strategy
 
@@ -1310,7 +1333,7 @@ The cost is the migration itself: the v4.4→v5.x API churn flagged in both this
 
 ### Recommended order of operations
 
-0. **Reconcile with the existing effort.** #1038 is a dead stub (supersede, don't fight); track Chris Howell's reconnect/watchdog work so a future IPv6 PR merges cleanly against `mqtt.cpp`/`net_manager.cpp`.
+0. **Reconcile with the existing effort, on authoritative info.** #1038 is a dead stub (supersede, don't fight). Get the *maintainer's* answer on the real next-release base (asked Chris Howell on Discord) rather than inferring it from the open-PR list — and specifically **do not rebase onto RAR's core-3 branches** (#1090/#1091); they are unmerged, undiscussed, non-contributor proposals, not the roadmap. Track Chris's reconnect work (NTP_Fixes #1089) and the GUI/`web_static` churn so a future IPv6 PR merges cleanly.
 1. **Land the `ArduinoMongoose` IPv6 patches** upstream (or get a release) — the hard dependency.
 2. **Decide the framework question** (the real fork in the road): is the upstream PR built on a v5.x bump, or does it ship dual-stack on stock v2.0.x with IPv6-only-DNS documented as needing v5.x? A v5.x bump is the cleaner answer and deletes our hacks, but it is the larger lift.
 3. **OpenEVSE source PR** on the chosen base — references released `ArduinoMongoose`, ships the application work as clean source, `custom_libs/` blobs removed.
