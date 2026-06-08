@@ -53,13 +53,26 @@ This is where v2 lives. On it we get, for free:
 - **Native global-AAAA mDNS** (IDF5 mdns reads all v6 slots) — the **slot-0 swap deletes**, and with it the source-selection side effect that forced the watchdog guard.
 - Our chargers are 16MB → eligible. The 4MB Olimex bench unit stays core-2 (the v1 implementation remains correct for it).
 
-### The integration crux: the ArduinoMongoose (+ ESPAL) double-fork
+### The ArduinoMongoose double-fork — investigated 2026-06-08
 
-**This is the one hard dependency.** Both efforts fork `ArduinoMongoose`:
-- **Ours:** `rnavarro/ArduinoMongoose#fix/ipv6-dual-stack` — IPv6 dual-stack listener/connect patches (against the older core-2 ArduinoMongoose).
-- **RAR's:** a git-pinned fork carrying **IDF5/core-3** fixes.
+Both efforts fork `ArduinoMongoose`. I diffed both forks against their common base to scope the merge. **Result: trivial at the merge-conflict level. The real residual is IDF5 build/behavior verification of our IPv6 patches, not a fork conflict.**
 
-For v2, ArduinoMongoose must carry **both** patch sets. Options: port our IPv6 patches onto RAR's IDF5 fork, or fold both into `jeremypoulter/ArduinoMongoose` as a tagged release. This is the highest-leverage coordination point with RAR. (ESPAL is also double-relevant but lighter.)
+The two forks (both off the same `jeremypoulter/ArduinoMongoose` merge-base `82a6f3b9`):
+
+| Fork | commits | files | what |
+|------|---------|-------|------|
+| **Ours** (`rnavarro/ArduinoMongoose#fix/ipv6-dual-stack`) | 5 | `src/mongoose.c` (+201/-37), `MongooseCore.cpp` (+56/-6), `MongooseMqttClient.cpp` (+1/-0), `MongooseMqttClient.h` (+8/-1) | IPv6 dual-stack: AAAA-first DNS w/ A fallback, IPv6 nameserver + UDP sendto fix, dual-stack socket path, `setTlsServerName` SNI for pre-resolved-IP connects |
+| **RAR's** (`RAR/ArduinoMongoose@cf237c4`) | 3 | `src/mongoose.c` (+40/-3) | mbedTLS 3.x API port (`net_sockets.h`, drop `ssl_internal.h`, port SSL interface) — the IDF5 *build* fix |
+
+**They edit disjoint regions of the only shared file (`mongoose.c`), verified against the same base:**
+- Ours: lines ~2382–3971 (`mg_parse_address`, `mg_do_connect`, `resolve_cb`, `mg_connect_opt`, socket send / open-listening-socket) + ~12234 (`mg_resolve_async_opt`) — the **DNS resolver + socket/connect** path.
+- RAR's: lines ~4879–5272 — entirely inside the **`mg_ssl_if_*` mbedTLS** block.
+
+No overlap, and RAR doesn't touch the other 3 files we edit. So the union is mechanical: apply both commit sets onto the `jeremypoulter` base (or fold both into a tagged `jeremypoulter/ArduinoMongoose` release). There is **no textual merge conflict** to reconcile. The earlier framing of this as "the one hard dependency / highest-leverage coordination point" overstated the *merge* difficulty.
+
+**The real residual (does NOT go away with the fork merge):** our IPv6 patches were written against the **core-2 socket/DNS APIs**; RAR's fork only makes ArduinoMongoose *build* on IDF5 (mbedTLS 3.x). Whether our IPv6 paths *compile and behave* on IDF5's lwIP is unproven — that is open-Q#3 / "verify on metal," and it is the actual v2 work. Clean source text ≠ working IPv6 on IDF5.
+
+**ESPAL is NOT a double-fork.** We use stock `jeremypoulter/ESPAL@0.0.4`; only RAR forks ESPAL (`RAR/ESPAL@f7678a7`) for IDF5. v2 just consumes RAR's ESPAL (or the folded-back `jeremypoulter` release) — nothing of ours to reconcile there.
 
 ### Conflict surface (rebasing v1's diff onto the next-release base)
 
@@ -80,10 +93,42 @@ Revisit. Our `731c0ae` exempts loopTask from the task watchdog around a **synchr
 
 ## Overlaps & opportunities with RAR's work
 
-- **mDNS netif-timing fix (RAR, #1090):** *"mDNS started on netif-up rather than at boot (null-netif boot crash)."* Adjacent to our mDNS work (slot-0 swap + the boot-loop we fixed). On core-3 our slot-0 swap deletes, but his netif-*timing* fix may still be the right startup model — compare notes before re-implementing.
+- **mDNS netif-timing fix (RAR) — investigated 2026-06-08, see dedicated subsection below.** Short version: adopt his netif-lifecycle model; it kills a *second, distinct* boot-crash class; it is **not in #1091** (the base we'd rebase onto), so v2 ports it or coordinates to peel it out of the #1090 WIP; and it needs a `GOT_IP6` restart added for our v6 case.
 - **Native test harness (`pio test -e native`, #1091):** RAR added a doctest-based native env. Our standalone `test/test_ipv6_select.cpp` + `run_host_tests.sh` (plain g++) is a natural candidate to **fold into `pio test -e native`** so the selector test runs in their CI matrix.
 - **FakeEVSE (`-DFAKE_EVSE`, `/fakeevse`, #1090 group 6):** runs the firmware with **no EVSE hardware attached**, driving charge states. Plus the **OpenEVSE_EV_Simulator** (Jez's dev-board tip) for mode switching. Both let us exercise charge sessions (state 254→3) during IPv6 testing without a vehicle.
 - **`http_update.cpp` OTA size guard (#1091):** rejects oversized images before erasing the partition — a safety net relevant to our OTA flashing.
+
+## mDNS startup model: RAR's netif-lifecycle vs ours (investigated 2026-06-08)
+
+This is the second half of the dig. I compared how upstream, our v1, and RAR start mDNS.
+
+**Upstream master + our v1 + #1091 all start mDNS at BOOT.** `MDNS.begin()` runs inside `NetManagerTask::begin()` right after `manageState()`, before any interface is guaranteed up (our `net_manager.cpp:888`; #1091 still does this at its line 539).
+
+**RAR's #1090 replaces boot-start with a netif-lifecycle model:**
+- New `_mdnsStarted` bool member; mDNS is **intentionally not started at boot**.
+- `startMDNS()` is called when a netif is actually up — on STA/ETH **got-IP** (`haveNetworkConnection()`) and on **SoftAP start**. It does a clean `MDNS.end()` then `MDNS.begin()` + re-adds services, so it re-binds to the current interface if already running.
+- `stopMDNS()` is called **before teardown** (WiFi stop) so mDNS async handlers never touch a freed/null netif.
+- His comment states the failure it fixes: boot-time start makes the mDNS predefined-interface handler join its multicast group on a **null netif → `esp_netif_is_netif_up(NULL)` load fault → even-cadence reboot loop**, seen on the **ESP32-P4 / ESP-Hosted** build.
+
+### This is a SECOND, distinct boot-crash class from ours
+
+Two different v6/mDNS-adjacent boot loops, different root causes:
+- **Ours (fixed, `731c0ae`):** a non-routable `3fff` GUA wins lwIP slot 0 (our slot-0 swap promotes it) → outbound source selection picks it → synchronous `getaddrinfo` stalls past the 5s task watchdog → reboot. Fixed by the loopTask watchdog guard in `mqtt.cpp`.
+- **RAR's (fixed in #1090):** boot-time `MDNS.begin()` on a null netif → `esp_netif_is_netif_up(NULL)` fault (P4/ESP-Hosted). Fixed by tying mDNS to the netif lifecycle.
+
+They don't overlap; both are worth carrying.
+
+### Two findings that shape the v2 plan
+
+1. **The netif-timing fix is in #1090, NOT #1091.** #1091 — the foundation we'd rebase onto — still has the boot-time `MDNS.begin()` (line 539). #1090 is the WIP umbrella ("not for merge"). So rebasing onto #1091 does **not** inherit the fix; v2 either ports RAR's netif-lifecycle model itself or coordinates with RAR to peel it out of #1090 into a mergeable PR. Either way we want it — it's a clean replacement for both our boot-time start and our raw-`mdns_init`/`mdns_free` re-init.
+
+2. **RAR's `startMDNS()` has no `GOT_IP6` case.** It is wired to v4 `WIFI_STA_GOT_IP` + `ETH_GOT_IP` + SoftAP only (the `GOT_IP6` tokens appear in his code only in the event-name debug map, not as switch cases). So a global v6 address arriving *after* the v4 got-IP would not re-bind mDNS. Whether IDF5 mdns auto-advertises a late-arriving global AAAA on an already-running responder is **unproven — metal-check** (folds into open-Q#3).
+
+### Recommended v2 mDNS shape
+
+Adopt RAR's netif-lifecycle model as the single startup discipline (start on got-IP / SoftAP, stop before teardown, `_mdnsStarted` guard, no boot start). On core-3 with native global-AAAA mDNS, **our slot-0 swap + the `mdns_init`/`mdns_free` re-init in `onGlobalIPv6Acquired()` delete entirely.** The only v6-specific addition is to make mDNS re-bind once the global v6 address is up: add a `GOT_IP6`-triggered `startMDNS()` (one line — `startMDNS()` already does end+begin), *or* metal-confirm IDF5 mdns picks up late v6 addresses without a restart. That single clean addition replaces our entire slot-0 hack.
+
+Note on the watchdog guard: its *trigger* (a non-routable address winning slot 0 via the swap) deletes with the swap, but a genuinely slow resolve could still stall `getaddrinfo` independent of slot-0, so keep the guard as cheap general insurance (consistent with the "does the watchdog fix still apply on core-3?" note above).
 
 ## Headroom / partition reality
 
@@ -93,22 +138,23 @@ Revisit. Our `731c0ae` exempts loopTask from the task watchdog around a **synchr
 
 ## Open questions / next digging
 
-1. **Compare the two ArduinoMongoose forks** — diff RAR's IDF5 fork against ours (`fix/ipv6-dual-stack`) to scope the IPv6+IDF5 merge. (Highest priority for v2.)
-2. **RAR's mDNS netif-timing fix** — read it; decide if it replaces/augments our startup handling on core-3.
-3. **IPv6 on core-3 reality check** — confirm IDF5 lwIP RDNSS config + mdns global-AAAA actually behave as expected on `openevse_wifi_v1_16mb` (don't assume; the v1 work taught us to verify on metal).
+1. ~~**Compare the two ArduinoMongoose forks.**~~ **DONE (2026-06-08)** — see "The ArduinoMongoose double-fork" above. Disjoint regions, same base, no merge conflict; ESPAL isn't a double-fork. The residual is IDF5 build/behavior of our IPv6 patches (rolls into #3).
+2. ~~**RAR's mDNS netif-timing fix.**~~ **DONE (2026-06-08)** — see "mDNS startup model" above. Adopt his netif-lifecycle model; it's in #1090 not #1091; add a `GOT_IP6` restart.
+3. **IPv6 on core-3 reality check (now the top residual)** — confirm on metal, on `openevse_wifi_v1_16mb`: (a) our IPv6 ArduinoMongoose patches *compile and behave* on IDF5 lwIP (they were written against core-2 APIs); (b) IDF5 lwIP RDNSS config works natively (drops our `liblwip.a`); (c) IDF5 mdns advertises the global AAAA — and specifically whether an already-running responder picks up a *late-arriving* v6 address without a restart, or whether we need the `GOT_IP6`-triggered `startMDNS()`. Don't assume; the v1 work taught us to verify on metal.
 4. **IPv4 static-IP feature** chris wants — a possible goodwill contribution / follow-up round (we declined v4 focus for now).
 5. **Does the watchdog/getaddrinfo trigger exist on core-3?** (see above).
 
 ## Recommended v2 sequencing
 
 0. **Wait** for the next release to stabilize (operator decision). Track #1091 + the stack; coordinate with RAR/chris.
-1. **Reconcile ArduinoMongoose** — get IPv6 + IDF5 patches into one fork/release (the hard dependency).
+1. **Combine ArduinoMongoose patch sets** — mechanical now (disjoint regions, same base): apply our 5 IPv6 commits + RAR's 3 mbedTLS commits onto `jeremypoulter/ArduinoMongoose`, or fold both into a tagged release. Coordinate with RAR/Jez on the fold-back. The *verification* (do our IPv6 paths build/behave on IDF5) is step 4, not here.
 2. **Rebase** v1's IPv6 logic onto the #1091 base, targeting `openevse_wifi_v1_16mb`.
-3. **Delete the hacks** that core-3 makes unnecessary: `custom_libs/liblwip.a` + `override_lwip.py` (native RDNSS), the mDNS slot-0 swap (native global-AAAA). Keep the watchdog guard until proven moot.
+3. **Delete the hacks** core-3 makes unnecessary and **adopt RAR's mDNS netif-lifecycle model** in their place: drop `custom_libs/liblwip.a` + `override_lwip.py` (native RDNSS); drop the mDNS slot-0 swap + `mdns_init`/`mdns_free` re-init (native global-AAAA); replace boot-time `MDNS.begin()` with `startMDNS()`/`stopMDNS()` on the netif lifecycle (port from #1090 since #1091 lacks it), plus a `GOT_IP6` restart for v6. Keep the watchdog guard until proven moot.
 4. **Re-validate on metal** (the v1 lesson): v6-only, renumber, mDNS AAAA, MQTT-over-v6, on a 16MB core-3 build. Use FakeEVSE/EV-Simulator to exercise sessions.
 5. **Fold the selector test** into `pio test -e native`.
 6. Re-flash the chargers to the core-3 16MB build (plan the flash method — likely not a simple OTA).
 
-## Correction log
+## Findings & correction log
 
+- **ArduinoMongoose / mDNS dig (2026-06-08):** downgraded "the one hard dependency" — the two ArduinoMongoose forks edit disjoint `mongoose.c` regions off the same base (no merge conflict), and ESPAL isn't even a double-fork. The real residual is IDF5 build/behavior of our IPv6 patches. Separately, RAR's mDNS netif-lifecycle fix is a clean replacement for our slot-0 hack but lives in #1090 (WIP), not #1091, and lacks a `GOT_IP6` restart. See the two dedicated sections above.
 - **RAR reassessment (2026-06-08):** earlier notes treated RAR's core-3 work as an unsanctioned external proposal "not the project's direction." chris1howell has since confirmed the next release builds from RAR's #1091 and ships his GUI. RAR is the de-facto next-release lead; coordinate accordingly. (`ipv6-implementation-plan.md` Upstreaming section should be read with this correction in mind.)
