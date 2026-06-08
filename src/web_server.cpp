@@ -343,6 +343,33 @@ handleAPOff(MongooseHttpServerRequest *request) {
 }
 
 // -------------------------------------------------------------------
+// Dump the live LwIP IPv6 address table (per-slot state + lifetimes).
+// Diagnostic for SLAAC / RA / renumbering behaviour — the GOT_IP6 serial
+// log only fires on events, so this gives an on-demand snapshot.
+// url: /debug/ipv6
+// -------------------------------------------------------------------
+#if MG_ENABLE_IPV6
+void
+handleDebugIpv6(MongooseHttpServerRequest *request) {
+  MongooseHttpServerResponseStream *response;
+  if(false == requestPreProcess(request, response, CONTENT_TYPE_TEXT)) {
+    return;
+  }
+
+  response->setCode(200);
+  response->print("preferred (reported) global: ");
+  response->print(net.getIpv6Global());
+  response->print("\r\n\r\n");
+  response->print(net.dumpIpv6Table("WIFI_STA_DEF"));
+#ifdef ENABLE_WIRED_ETHERNET
+  response->print("\r\n");
+  response->print(net.dumpIpv6Table("ETH_DEF"));
+#endif
+  request->send(response);
+}
+#endif
+
+// -------------------------------------------------------------------
 // Change divert mode (solar PV divert mode) e.g 1:Normal (default), 2:Eco
 // url: /divertmode
 // -------------------------------------------------------------------
@@ -1215,6 +1242,9 @@ void web_server_setup()
   server.on("/r$", handleRapi);
   server.on("/scan$", handleScan);
   server.on("/apoff$", handleAPOff);
+#if MG_ENABLE_IPV6
+  server.on("/debug/ipv6$", handleDebugIpv6);
+#endif
   server.on("/divertmode$", handleDivertMode);
   server.on("/shaper$", handleCurrentShaper);
   server.on("/emoncms/describe$", handleDescribe);

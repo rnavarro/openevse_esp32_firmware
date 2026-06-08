@@ -1189,6 +1189,41 @@ Items 1-3 are already part of v0 Phase 2 (the dual-stack listener is needed for 
 - [x] Memory impact: RAM +136 bytes (+0.04%, 63,360→63,496 of 327,680). Well within heap budget.
 - [x] Flash impact: Flash +11,120 bytes (+0.6%, 1,841,185→1,852,305 of 1,966,080). Fits 16MB partition at 94.2%.
 
+### Address-reporting fix: live-state-derived, RFC 6724-informed tiebreak (2026-06-07)
+
+The "fix still deferred" note on the address-change-resilience item above is now resolved. The two bugs that characterization surfaced — last-writer-wins on the single `_ipv6address_global_wifi` String, and the String referencing an address no longer on the interface — are fixed by deriving the reported/advertised address from **live LwIP state at call time** instead of from event-written Strings. Events alone cannot observe SLAAC invalidation (there is no LOST_IP6 path), so any cached String is structurally unable to stay correct; reading the netif's address table on each call is the only reliable source.
+
+**Scope (important):** this tiebreak governs *which address the device reports for inbound reachability* — the mDNS AAAA record and the `/status` / API display. It is **not** outbound source-address selection. LwIP owns source selection via `ip6_select_source_address()` (full RFC 6724), and that path is untouched. What this code answers is the narrower question "of the addresses currently on this interface, which single one should a peer be told to reach us on," where preferring a globally-scoped, non-deprecated address is the correct answer.
+
+**Tiebreak.** Both report sites score each live slot identically and keep the highest:
+
+```
+score = (ip6_addr_isglobal(a)        ? 2 : 0)   // scope: GUA outranks ULA
+      + (ip6_addr_ispreferred(state) ? 1 : 0)   // state: preferred outranks deprecated
+```
+
+giving the order preferred-GUA (3) > deprecated-GUA (2) > preferred-ULA (1) > deprecated-ULA (0). Selection is strict `>` (`if (score > best_score)`), so the incumbent / lower slot wins ties — stable across calls. The scope term is RFC 6724 Rule 2 (prefer larger scope); the preferred/deprecated term is Rule 3 (avoid deprecated). Higher-numbered Rule-6/8 distinctions (label match, longest-prefix) are deliberately not modeled — they matter for *source* selection against a specific destination, not for advertising a single reachable address. The two sites:
+
+- `livePreferredGlobal(ifkey)` in `src/net_manager.cpp` — backs `/status`, `getIpv6Global()`, and the MQTT announce address.
+- the mDNS slot-swap loop in `onGlobalIPv6Acquired()` — picks the slot promoted into LwIP slot 0 so the (unpatched v4.4) mDNS responder advertises it.
+
+**`/debug/ipv6` endpoint** (`handleDebugIpv6()` in `src/web_server.cpp`, `#if MG_ENABLE_IPV6`): dumps the full per-slot LwIP table (`v6[i] <addr> <STATE> <scope> valid=.. pref=..`) for WiFi STA and ETH via `dumpIpv6Table()`. Same backing function as the GOT_IP6 serial log. Works without auth (empty `www_username`) so it is reachable during a v6-only bring-up before credentials matter. This was the instrument used for all the validation below.
+
+**Validation — by parts (the tiebreak's legs are each proven live; the all-up distinct-prefix ordering is rig-blocked).**
+
+The tiebreak is arithmetic over three classifications, each of which was exercised on hardware:
+
+1. **Scope term (`isglobal`).** Test B (ULA-deprecate) confirmed a GUA is scored above a ULA: with both a real GUA and an injected ULA present, `/status` and mDNS reported the GUA, not the last-written ULA — the original last-writer-wins bug no longer reproduces.
+2. **State term (`ispreferred` / `isdeprecated`).** Captured live at 05:41 and 05:47 via `/debug/ipv6`: a slot transitioning to `DEPRECATED` is correctly classified and de-ranked relative to a `PREFERRED` slot of the same scope.
+3. **Renumber path end-to-end.** A real network switch at 10:06 (moving the device between segments) drove a global-address change all the way through to `MQTT: IPv6 address changed, reconnecting` — the change-detection event fires and the MQTT reconnect path runs on a genuine address change, not just a synthetic one.
+
+**Test C (order two *distinct* GUAs by the `score > best_score` step) — NOT observed; blocked by the test rig.** The intent was a deprecated-old-GUA + preferred-new-GUA window where the two are *different addresses*, exercising the numeric ordering directly. This window could not be produced on this segment:
+
+- The external RA injector available on this VLAN only ever re-emits the segment's real prefix `2602:80f:c004:8::/64`; it never emitted the requested distinct prefix (`3fff:1234:5678::/64`). Live `/debug/ipv6` during the attempt showed slot 0 and slot 2 both holding the *same* `2602:…:c104` GUA — no second distinct GUA ever materialized.
+- The real WLAN_IOT router periodically refreshes `2602::` back to PREFERRED, racing any deprecation, so even the same-prefix lifetime could not be held in the deprecated state long enough to stage against a second preferred GUA.
+
+The un-observed case is purely the `>` comparison choosing between two scores that are *each already proven* to be computed correctly (legs 1–2) on inputs that are *already proven* to flow through the change path (leg 3). I am recording it as validated-by-parts / blocked-by-rig rather than as a passed end-to-end test, because the simultaneous-two-distinct-GUA state was never actually present on the wire. Exercising it would need a controllable RA source on an isolated segment (no competing real router), which this rig does not provide.
+
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
 
 ## Testing Gaps from IoTaWatt Cross-Review (2026-06-04)
