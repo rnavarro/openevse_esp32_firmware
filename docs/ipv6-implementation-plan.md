@@ -1264,6 +1264,58 @@ Dev- and diagnostic-only items to decide on before submitting upstream (kept her
 | `/debug/ipv6` diagnostic endpoint | `src/web_server.cpp` `handleDebugIpv6()` | Auth-gated like all endpoints, but dumps the internal per-slot table. Keep as-is, gate behind a debug build flag, or drop for release — upstreamer's call. |
 | mDNS slot-0 swap | `src/net_manager.cpp onGlobalIPv6Acquired()` | Workaround for the precompiled v4.4 `libmdns.a`. Superseded by option 2 below (rebuild that reads all slots) if/when that is built; until then the watchdog fix bounds its one downside. |
 
+## Upstreaming: landscape, constraints, and strategy (2026-06-08)
+
+This section records what we learned about getting this work upstream. Short version: **the fork serves the chargers today; upstreaming is a separate, deliberate project whose real prerequisite is a framework bump, not the IPv6 code itself.** Nothing here is urgent.
+
+### The hard constraint: the framework we build on is End-of-Life
+
+- **ESP-IDF v4.4 reached EOL in July 2024** (Espressif End-of-Life Advisory AR2024-008). Per Espressif's support policy, EOL branches get *no* new features, bug fixes, or security fixes — "it is our policy to not continue fixing bugs in End of Life releases." `v4.4.8` (2024-06-28) was the last v4.4 patch, ever.
+- **arduino-esp32 2.0.x** (the wrapper that bundles IDF v4.4) is likewise stale: last release `2.0.17` on 2024-05-23. The project is now on `3.3.x` (IDF v5.x) with a `4.0.0-alpha` out.
+- **Consequence:** the two framework-level patches we rely on — RDNSS enablement in `liblwip.a`, and the mDNS global-AAAA fix in `libmdns.a` — **cannot be landed upstream**, because the only upstream that would host them (v4.4) is policy-closed. There is no PR that gets these into the framework we currently use.
+- **Both fixes already exist in IDF v5.x / arduino-esp32 3.x** (RDNSS is a config option; the mDNS responder reads all v6 slots natively — Espressif's own fix). So we did not lose a contribution; we locally backported things that exist upstream-of-us in a newer release.
+
+### What is upstreamable vs. what is fork-only
+
+- **Upstreamable as application source (works on the stock framework):** the dual-stack listener, the RFC 6724 inbound-advertisement selector + its host test, the MQTT IPv6/DNS path, the loopTask-watchdog fix, the address-change/renumber handling, the `/debug/ipv6` instrument, and the mDNS slot-0 swap. None of this is welded to v4.4; it would need *porting* to v5.x but the design and the edge-case fixes transfer.
+- **Fork-only (cannot be an app-repo PR):** the custom `liblwip.a` (RDNSS) and any patched `libmdns.a`. These are the binary blobs in `custom_libs/`. They were committed as **test scaffolding** to get the local build working and validated — they were never the intended upstream form. The intended distribution mechanism for them (per Phase 0) is a forked arduino-esp32 package referenced via `platform_packages`, not a vendored `.a`. Either way they ride *outside* a clean OpenEVSE source PR.
+
+### The real unlock: bump to arduino-esp32 3.x / IDF v5.x
+
+The clean long-term path is not "rebuild the libs" or "fork the framework" — it is **migrating OpenEVSE to arduino-esp32 3.x**. On v5.x:
+
+- RDNSS is available as a config flag → the custom `liblwip.a` blob disappears.
+- The mDNS responder advertises the global AAAA natively → **the slot-0 swap deletes entirely**, and with it the source-selection hazard that forced the loopTask-watchdog fix.
+- Both `custom_libs/` blobs retire.
+
+The cost is the migration itself: the v4.4→v5.x API churn flagged in both this plan and the IoTaWatt cross-review (`esp_littlefs`, `esp32-camera`, mDNS API variation, etc.). That is weeks of work, not an afternoon — but it is *normal upstream-track work*, independently valuable to OpenEVSE (security, support, modern toolchain), and it is what makes a good IPv6 implementation possible at all. **The framework bump is a better, more welcome contribution than the IPv6 code would have been on its own.**
+
+### Dependency order
+
+- The hard dependency that must land first is **`ArduinoMongoose`**: this firmware depends on `rnavarro/ArduinoMongoose#fix/ipv6-dual-stack` (the `TEMP` line in `platformio.ini`). A clean OpenEVSE PR cannot reference a fork branch; the IPv6 dual-stack patches must land in `jeremypoulter/ArduinoMongoose` (or a tagged release) first.
+- The framework patches are **not** a "land upstream first" item (impossible, per above) — they become the bump-vs-fork-vs-document decision and do **not** gate the source PR, which degrades gracefully (dual-stack works on the stock framework; only IPv6-*only*-DNS needs the v5.x RDNSS feature).
+
+### Upstream landscape (as of 2026-06-08)
+
+- **Target repo:** `OpenEVSE/openevse_esp32_firmware` (our `upstream` remote), base branch `master`. Note the OpenEVSE *org* repo is the live target, though `jeremypoulter` historically handled maintenance (and owns the `ArduinoMongoose` dependency).
+- **Who merges what:** **Chris Howell (`chris1howell`)** is the active human landing *substantive code* (very recently — 2026-06-04). **Jeremy Poulter (`jeremypoulter`)** still has merge rights but is mostly handling dependabot/maintenance now. Engage Chris for networking work.
+- **Existing IPv6 effort — PR #1038** ("Add IPv6 support for WiFi and Ethernet interfaces", branch `copilot/add-ipv6-support`): a **28-line Copilot-bot stub**, opened and abandoned 2026-02-14, no framework bump. It only calls `enableIpV6()` and surfaces `WiFi.localIPv6()` — which on stock v2.0.x is the **link-local** address, i.e. it reports something unreachable from off-link. It is not a serious implementation; the field is effectively open. Not worth fighting.
+- **Active overlap — PR #1087 / #1088** (Chris Howell's `Net_Fixes`): a 32-file overhaul fixing WiFi reconnect-after-brownout (issue #1004), MQTT reconnect hang, and NTP boot-sync (#1003), touching `mqtt.cpp`/`net_manager.cpp`/`time_man.*` — our files. It **was merged then reverted the same day** (2026-06-04) after regressions (NTP sync / Mongoose `_nc` timing / a watchdog change). So `master` currently has neither those fixes nor ours; #1003/#1004 are effectively still open.
+  - **Relationship to our work:** complementary, not the same. Their watchdog is a "connection died without a disconnect event → reconnect" watchdog plus an MQTT connect-timeout rework; ours is a *task*-watchdog exemption around a blocking `getaddrinfo()`. Different root causes; neither solves the other's bug. **Caveat:** both touch the `_connecting`/connect-timeout logic in `mqtt.cpp`, so our changes must reconcile with whatever shape theirs lands in. **Limiter:** our watchdog fix guards the `#if MG_ENABLE_IPV6` cold-resolve path, which does not exist on stock (IPv4-only) upstream — so it is not a drop-in gift to their IPv4 reconnect problem; the overlap is the subsystem and the methodology, not the literal patch.
+
+### Lessons that shape the strategy
+
+- **Small surgical changes survive; big batches get reverted.** #1087 was a 32-file overhaul that destabilized and was backed out within a day. Our work has trended the other way (a ~30-line watchdog fix with a hardware reproduction rig, a host-tested selector). That is the contribution shape that lands.
+- **Rigor is the differentiator.** The reverted upstream batch lacked the kind of reproduction/serial-trace root-causing we used (RA injection via radvd, `/debug/ipv6`, serial monitor). Our hardware-found edge-case map — the v6-only `WL_CONNECTED`-gated-on-DHCPv4 blocker, the mDNS global-AAAA gap, the source-selection trap, the blocking-DNS reboot loop, renumbering resilience — is the most valuable IPv6 artifact for this project and is largely framework-independent.
+
+### Recommended order of operations
+
+0. **Reconcile with the existing effort.** #1038 is a dead stub (supersede, don't fight); track Chris Howell's reconnect/watchdog work so a future IPv6 PR merges cleanly against `mqtt.cpp`/`net_manager.cpp`.
+1. **Land the `ArduinoMongoose` IPv6 patches** upstream (or get a release) — the hard dependency.
+2. **Decide the framework question** (the real fork in the road): is the upstream PR built on a v5.x bump, or does it ship dual-stack on stock v2.0.x with IPv6-only-DNS documented as needing v5.x? A v5.x bump is the cleaner answer and deletes our hacks, but it is the larger lift.
+3. **OpenEVSE source PR** on the chosen base — references released `ArduinoMongoose`, ships the application work as clean source, `custom_libs/` blobs removed.
+4. **Cheapest durable move, available now regardless of the above:** distill the hardware-found edge cases into a standalone "IPv6 on OpenEVSE: implementation notes & edge cases" doc suitable to drop on the tracker. It is valuable to us, makes the eventual PR cheaper, and stakes a credible claim — even if the full port never happens.
+
 ## Testing Gaps from IoTaWatt Cross-Review (2026-06-04)
 
 The parallel IoTaWatt ESP8266 IPv6 effort (`~/workspace/IoTaWatt/ai_notes/ipv6_implementation_plan.md`)
