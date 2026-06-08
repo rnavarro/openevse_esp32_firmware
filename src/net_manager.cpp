@@ -8,6 +8,7 @@
 #include "espal.h"
 #include "time_man.h"
 #include "event.h"
+#include "ipv6_select.h"
 
 #include "LedManagerTask.h"
 
@@ -286,18 +287,19 @@ String NetManagerTask::livePreferredGlobal(const char *ifkey)
   if (!netif) return "";
   struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(netif);
   if (!lwip_nif) return "";
-  int best = -1, best_score = -1;
+  // Translate live lwIP per-slot state into POD and rank with the shared,
+  // host-tested selector (ipv6_select.h). Same operator the unit test asserts.
+  Ipv6SlotInfo slots[LWIP_IPV6_NUM_ADDRESSES];
   for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
     u8_t state = netif_ip6_addr_state(lwip_nif, i);
-    if (!ip6_addr_isvalid(state)) continue;  // skip INVALID/TENTATIVE
     const ip6_addr_t *a = ip_2_ip6(&lwip_nif->ip6_addr[i]);
-    if (ip6_addr_isany(a) || ip6_addr_islinklocal(a)) continue;
-    int score = (ip6_addr_isglobal(a) ? 2 : 0) + (ip6_addr_ispreferred(state) ? 1 : 0);
-    if (score > best_score) {
-      best = i;
-      best_score = score;
-    }
+    slots[i].valid       = ip6_addr_isvalid(state);
+    slots[i].isAny       = ip6_addr_isany(a);
+    slots[i].isLinkLocal = ip6_addr_islinklocal(a);
+    slots[i].isGlobal    = ip6_addr_isglobal(a);
+    slots[i].isPreferred = ip6_addr_ispreferred(state);
   }
+  int best = ipv6SelectAdvertisedSlot(slots, LWIP_IPV6_NUM_ADDRESSES);
   if (best < 0) return "";
   return IPv6Address(ip_2_ip6(&lwip_nif->ip6_addr[best])->addr).toString();
 }
@@ -362,18 +364,19 @@ void NetManagerTask::onGlobalIPv6Acquired(const char *ifkey)
   if (swap_netif) {
     struct netif *lwip_nif = (struct netif *)esp_netif_get_netif_impl(swap_netif);
     if (lwip_nif) {
-      int best = -1, best_score = -1;
+      // Same shared selector as livePreferredGlobal(): the AAAA we advertise
+      // must match the address /status reports.
+      Ipv6SlotInfo slots[LWIP_IPV6_NUM_ADDRESSES];
       for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
         u8_t state = netif_ip6_addr_state(lwip_nif, i);
-        if (!ip6_addr_isvalid(state)) continue;  // skip INVALID/TENTATIVE
         const ip6_addr_t *a = ip_2_ip6(&lwip_nif->ip6_addr[i]);
-        if (ip6_addr_isany(a) || ip6_addr_islinklocal(a)) continue;
-        int score = (ip6_addr_isglobal(a) ? 2 : 0) + (ip6_addr_ispreferred(state) ? 1 : 0);
-        if (score > best_score) {
-          best = i;
-          best_score = score;
-        }
+        slots[i].valid       = ip6_addr_isvalid(state);
+        slots[i].isAny       = ip6_addr_isany(a);
+        slots[i].isLinkLocal = ip6_addr_islinklocal(a);
+        slots[i].isGlobal    = ip6_addr_isglobal(a);
+        slots[i].isPreferred = ip6_addr_ispreferred(state);
       }
+      int best = ipv6SelectAdvertisedSlot(slots, LWIP_IPV6_NUM_ADDRESSES);
       if (best > 0) {
         ip_addr_t tmp_addr = lwip_nif->ip6_addr[0];
         lwip_nif->ip6_addr[0] = lwip_nif->ip6_addr[best];
