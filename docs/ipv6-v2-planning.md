@@ -91,6 +91,26 @@ So the rebase is bounded: build config + two shared files. The core IPv6 logic (
 
 Revisit. Our `731c0ae` exempts loopTask from the task watchdog around a **synchronous `getaddrinfo`** in the `#if MG_ENABLE_IPV6` cold-resolve path. On core-3 the DNS/source-selection situation differs (native RDNSS, no slot-0 swap → no non-routable address winning slot 0), so the *trigger* may not exist. Keep the guard until proven unnecessary on core-3, then decide whether to drop it. It's cheap insurance regardless.
 
+### Maintenance & fork reduction: what the core-3/IDF5 base buys us
+
+The migration's real payoff is maintenance, and it lands at two layers.
+
+**Our IPv6-specific fork surface shrinks materially.** v1 carries, just for IPv6:
+- `custom_libs/liblwip.a` — a tracked ~4MB binary lwIP fork rebuilt to expose RDNSS.
+- `override_lwip.py` — the build hook that injects it.
+- the mDNS slot-0 swap + `mdns_init`/`mdns_free` re-init (in-tree workaround for the precompiled mdns reading only slot 0).
+- the ArduinoMongoose IPv6 patches (`rnavarro/ArduinoMongoose#fix/ipv6-dual-stack`).
+- the loopTask watchdog guard.
+
+On core-3/IDF5 the first three are *expected* to delete (native RDNSS, native all-slot global-AAAA mdns) — **pending metal verification, open-Q#3**. That removes a binary blob, a build hook, and an in-tree hack. The residual is the Mongoose IPv6 patches (which fold into the project's existing `jeremypoulter/ArduinoMongoose` fork rather than standing alone) plus possibly the watchdog guard. So our standalone surface drops from "binary lwIP fork + build script + mdns hack + Mongoose patches + guard" to "Mongoose patches (folded) + maybe the guard."
+
+**The base goes from EOL to supported — the deeper win.** IDF 4.4 (EOL July 2024) and arduino-esp32 2.0.x get no upstream fixes, which is *why* we had to hand-build RDNSS in the first place. On IDF 5.5.4 / arduino-esp32 3.3.8 the upstream ships those capabilities natively: the framework now does the work we were forking to do, and security/bug fixes flow again. "Fewer forks" is really a symptom of "the base is alive."
+
+**Caveats — don't oversell "closer to upstream":**
+- The *build platform* moves from the official `platformio/platform-espressif32@6.12.0` to **pioarduino's** `platform-espressif32`. pioarduino is a community fork that exists because the official platform lagged on arduino-esp32 3.x / IDF5. So at the platform layer the project adopts the living *fork*, not the official upstream — closer to the current framework, but via a community-maintained platform (a dependency to watch).
+- **ArduinoMongoose stays a fork regardless.** The project's networking stack is a patched Mongoose 6.14 amalgamation; IDF5 doesn't change that, and Mongoose 7.x (Cesanta's rewrite) isn't in play. That foundational fork is unaffected by the migration.
+- **Two-core coexistence is temporarily *more* maintenance, not less.** While both core-2 (4MB) and core-3 (16MB) build from one tree, the project carries two platforms, the `scripts/pio` cache isolation, the version-guards, and a CI matrix. The simplification only fully lands if/when core-2 (4MB) is deprecated — exactly the question put to Chris in the 2026-06-08 Discord post (answer pending).
+
 ## Overlaps & opportunities with RAR's work
 
 - **mDNS netif-timing fix (RAR) — investigated 2026-06-08, see dedicated subsection below.** Short version: adopt his netif-lifecycle model; it kills a *second, distinct* boot-crash class; it is **not in #1091** (the base we'd rebase onto), so v2 ports it or coordinates to peel it out of the #1090 WIP; and it needs a `GOT_IP6` restart added for our v6 case.
@@ -156,5 +176,6 @@ Note on the watchdog guard: its *trigger* (a non-routable address winning slot 0
 
 ## Findings & correction log
 
+- **Discord post to maintainers (2026-06-08):** posted in the OpenEVSE Discord — flagged the two-core work, said our v1 patches are on 2.x/4.4, and asked Chris directly whether core-2/4MB is headed for deprecation (kept only for backwards-compat) or stays a first-class target. The answer determines whether "Track A" (upstreaming our existing IDF4 IPv6 work for the core-2 builds) is worth pursuing or whether we go IDF5-only. **Pending his reply.** Also stated we'll start a fresh IPv6 patch set against 3.x / IDF 5.5.
 - **ArduinoMongoose / mDNS dig (2026-06-08):** downgraded "the one hard dependency" — the two ArduinoMongoose forks edit disjoint `mongoose.c` regions off the same base (no merge conflict), and ESPAL isn't even a double-fork. The real residual is IDF5 build/behavior of our IPv6 patches. Separately, RAR's mDNS netif-lifecycle fix is a clean replacement for our slot-0 hack but lives in #1090 (WIP), not #1091, and lacks a `GOT_IP6` restart. See the two dedicated sections above.
 - **RAR reassessment (2026-06-08):** earlier notes treated RAR's core-3 work as an unsanctioned external proposal "not the project's direction." chris1howell has since confirmed the next release builds from RAR's #1091 and ships his GUI. RAR is the de-facto next-release lead; coordinate accordingly. (`ipv6-implementation-plan.md` Upstreaming section should be read with this correction in mind.)
