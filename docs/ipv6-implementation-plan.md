@@ -1305,8 +1305,27 @@ The cost is the migration itself: the v4.4→v5.x API churn flagged in both this
 
    Implications:
    - The **production chargers are 16MB → core-3.x-eligible.** So the "v5.x deletes the hacks" path (native RDNSS, native mDNS global AAAA, no slot-0 swap) genuinely applies to the real deployment targets if/when a core-3 migration lands — it is not merely hypothetical for them. Only the **4MB Olimex bench unit** is stuck on core-2/IDF4, where the current hacks remain mandatory.
-   - The **~110KB-headroom / 94%-flash-usage concern documented elsewhere in this plan is a 4MB-board artifact.** The 16MB `openevse_wifi_v1` chargers have a far larger app partition and ample room for the IPv6 additions.
-   - **Validation caveat:** the IPv6 work has been validated on the 4MB Olimex but will deploy on 16MB `openevse_wifi_v1`. Same core-2/IDF4 firmware approach today (so the logic carries), but the dev board is not representative on flash headroom or on future framework eligibility.
+   - **Correction (proven at rollout, 2026-06-08): the app-partition headroom is the SAME on the 16MB chargers — the earlier "ample room" note was wrong.** The `openevse_wifi_v1` build links into a `1966080`-byte (~1.88MB) app slot at **94.5% used (~106KB free)** — identical to the 4MB Olimex — because the app-slot size is set by the **partition table (`min_spiffs`), not the flash chip.** The extra 16MB is present but unused for the app slot. The real advantage is an **escape valve the 4MB board lacks:** if the app ever outgrows ~1.88MB, `openevse_wifi_v1` can be repointed at a 16MB partition CSV (e.g. `openevse_16mb.csv`, ~6.25MB app) without new hardware. As shipped today, treat charger headroom as the same tight ~106KB.
+   - **Validation caveat:** the IPv6 work was validated on the 4MB Olimex; the chargers are 16MB `openevse_wifi_v1`. Same core-2/IDF4 firmware and same app partition today (so the logic *and* the size budget carry), but the dev board is not representative on future framework eligibility.
+
+### Production rollout to the chargers (2026-06-08)
+
+Both production chargers were flashed with the IPv6 firmware (`integration` `f0593ec`, env `openevse_wifi_v1`) and verified live. Result: **both run dual-stack and use IPv6 as the active MQTT transport.**
+
+- **Build wiring confirmed:** `openevse_wifi_v1` inherits the full IPv6 stack — `-D MG_ENABLE_IPV6=1` and the ArduinoMongoose fork via `${common.*}`, and the `override_lwip.py` RDNSS `liblwip.a` via the global `[env] extra_scripts`. No env-specific IPv6 changes were needed.
+- **OTA, staged:** flashed one at a time via `curl -F file=@firmware.bin http://<ip>/update` (HTTP 200), `openevse-single` first and verified healthy before `openevse-double`. The EVSE state (254/sleeping) was preserved across the flash — the safety MCU (separate unit over RAPI) is undisturbed by a WiFi-module reflash.
+- **Per-charger result** (dual-stack on WLAN_2G `2603:8000:2d00:4605::/64`):
+
+  | Charger | IPv6 GUA | IPv4 | MQTT transport (broker-confirmed) |
+  |---------|----------|------|-----------------------------------|
+  | openevse-single `172.16.5.113` | `…:b2a7:32ff:fefe:33c` | 172.16.5.113 | **IPv6** |
+  | openevse-double `172.16.5.187` | `…:b2a7:32ff:fefd:21c8` | 172.16.5.187 | **IPv6** |
+
+- **MQTT-over-v6 verified at the broker, not just the device.** The custom Go broker (gokrazy `mqtt-server`) logs each client's source address. Both chargers show the firmware's designed handshake: a brief IPv4 connect on boot, then an upgrade to IPv6 within ~4–5s (e.g. double: `11:46:30 connect 172.16.5.187` → `11:46:34 disconnect v4` → `11:46:35 connect [..:fefd:21c8]`). Device `/status` only reports `mqtt_connected` (not the family), so the broker log is the authoritative v4-vs-v6 check.
+- **Verification gotchas (for next time):**
+  - The chargers have **no serial console to us** (network-only). Verify via `/status` (`mqtt_connected`, `state`, `version`), `/config` (`espflash`, `version`), `/debug/ipv6`, and the broker log. There is no live crash visibility like the bench Olimex's USB serial.
+  - The gokrazy `/log?...&stream=stdout` endpoint **line-buffers** — the most recent log line stays invisible until the next write flushes it, and the endpoint needs Basic Auth. To read the true latest event, generate one more event (e.g. restart any client) to flush the pipe, then re-fetch.
+  - `mqtt_connected` reads `0` for a few seconds right after boot (cold DNS resolve + connect in progress); re-poll before concluding a failure.
 
 ### Dependency order
 
