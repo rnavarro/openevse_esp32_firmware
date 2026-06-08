@@ -12,6 +12,27 @@ OpenEVSE is two MCUs:
 
 **Consequence for this migration:** a Mongoose rewrite lives entirely on the comms/UI side. It cannot compromise charging safety — the controller won't honor anything outside its envelope, and we never touch its firmware. So the risk profile of M7 is **connectivity / OCPP / OTA reliability regression** (a software-quality concern), not a safety-certification concern. The maintainer bar is "convince them it won't regress remote control/monitoring," not "pass a safety review."
 
+## Background: how the firmware got to Mongoose (and why)
+
+The networking lineage, from this repo's git history (the project began life as `ESP8266_WiFi_v2.x`):
+
+1. **Basic web server** (early ESP8266 firmware).
+2. **ESPAsyncWebServer** (me-no-dev's async lib) — `d70014e Initial code to change to use ESPAsyncWebServer`. The commits from this era are a maintenance trail: library renames breaking the build, version-pinning "to ensure replicable builds", "Fix to stop creating excessive websockets on error", "Websocket issues with IE/Edge".
+3. **Mongoose** — `d0c1123 Initial version to use Mongoose` → `First version with Mongoose 'working'` → `Added working websocket server` → **`8baa42d Changed EmonCMS posting to use Mongoose, adds HTTPS support`** → `92564af Initial port of MQTT to Mongoose`.
+
+Why Mongoose, per what the record supports:
+- **TLS.** The EmonCMS commit literally says "adds HTTPS support." ESPAsyncWebServer/ESPAsyncTCP had no real outbound TLS; Mongoose did. For a device posting to cloud energy services and doing MQTT-TLS, that was the driver.
+- **One library for everything.** Mongoose does HTTP server + HTTP client + WebSocket + MQTT + SNTP + TLS in one async event loop, identically on ESP8266 and ESP32 — replacing a pile of separate libs (async web server + TCP + MQTT + …).
+- **ESPAsyncWebServer was a maintenance liability** (the build-breakage / websocket-bug trail above).
+
+It was a move *toward* capability (unified TLS), not around a missing feature — HTTP/WS/MQTT/TLS all existed in Mongoose 6.x.
+
+**Why it looks low-level.** The wrapper has a routing layer (`MongooseHttpServerEndpoint`, `on(uri, handler)`, `sendAll(endpoint, …)`); the firmware registers endpoints rather than hand-rolling routing. The raw `http_message` / event-handler code is the wrapper's *thin veneer* over Mongoose's C API — thin on purpose: on a microcontroller it points into Mongoose's already-parsed buffers instead of deep-copying into fat C++ objects (note the `MG_COPY_HTTP_MESSAGE` opt-in for when a copy is actually needed).
+
+**The local-patch pattern.** ArduinoMongoose vendors Mongoose 6.18 and carries a local patch set re-applied on each version bump ("MONGOOSE_6-18 — adding back some of the changes made locally"): SNTP fixes, ESP8266/ESP32 build glue (`extern "C"` lwIP poll scheduling, `ETH.h`, a `PRId64` ESP8266 hack), VLA→fixed-buffer for safety, binary-streaming fixes. Mostly platform glue, not feature divergence. **Our IPv6 work is the newest entry in that same pattern** — which is why adding it as a wrapper patch is consistent with how the library has been maintained for years.
+
+*(All of the above is read from commit messages + code structure; the stated intent isn't documented in the repo or the OpenEVSE Discord, so the drivers are strongly implied by the record, not a maintainer quote. Definitive confirmation is a question for Jez.)*
+
 ## Why M7 at all
 
 - The bundled Mongoose is **6.18** — the last 6.x release (~Feb 2021), **EOL**. Same dead-dependency pattern as IDF 4.4, but on the networking library.
@@ -75,6 +96,26 @@ The wrapper's public/inline methods reach directly into 6.x amalgamation types, 
 ## Relationship to the IPv6 work
 
 M7 would **obsolete** our IPv6 patches (it does dual-stack itself). That is a reason to **sequence M7 after** landing IPv6 on core-3, not instead of it: IPv6-on-core-3 is near, validated, and useful now; M7 is a larger, speculative rewrite needing maintainer buy-in. If M7 lands later, our IPv6 work ages out gracefully (it bridged the interim and taught us the stack). Do **not** block a near-term validated feature on a speculative rewrite.
+
+## Strategy: upstreaming vs. updating
+
+A natural framing is "there are unupstreamed patches, so the work is to ship them upstream." Two facts redirect that:
+
+- **ArduinoMongoose is a wrapper, not a Cesanta fork** — it stays regardless of the patches. The local patches don't "cause" the fork; the wrapper exists for its own sake (the Arduino/C++ classes + lwIP glue).
+- **The patches can't go to Cesanta** — Mongoose 6.x is EOL (7.x since late 2020; 6.18 was the last 6.x). There is no live 6.x to upstream into, and much of the patch set is platform glue Cesanta wouldn't take anyway.
+
+So there are two distinct "upstreams," and only one is a live path:
+
+1. **Our IPv6 work → fold into `jeremypoulter/ArduinoMongoose` + the firmware.** This is the upstreaming that applies: merge `rnavarro/ArduinoMongoose#fix/ipv6-dual-stack` back into Jez's wrapper so the project carries it, dissolving our private fork and colocating the work. Near-term, tractable.
+2. **The wrapper's vendored-6.18-with-glue → fixed by *updating* (M7), not by upstreaming to Cesanta.** On 7.x most of the local patch set evaporates (IPv6 native → our patches retire; SNTP/streaming handled upstream), you're back on a maintained base that gets security fixes, and the residual local patches shrink to thin Arduino/ESP glue that legitimately stays downstream.
+
+**Course of action (phased):**
+
+- **Now:** land IPv6 as a folded patch into Jez's wrapper + firmware, on core-3. Don't chase Cesanta 6.x upstreaming — it goes nowhere.
+- **Strategic:** the M7 migration (this doc) is the durable fix for "carrying patches on an EOL library." Propose to Jez/Chris; sequence after IPv6-on-core-3 (M7 retires the IPv6 patches, so don't block a near, validated feature on a speculative rewrite).
+- **Opportunistic:** any local fix that is a genuine Mongoose bug still present in 7.x can be PR'd to Cesanta during the M7 work — a side benefit, not the strategy.
+
+The model: you're not making a fork vanish by upstreaming patches one by one. You're (a) folding *your* work into the project so you don't hold a private fork, and (b) moving the project's vendored library from a dead version to a live one, which is what actually drains the patch burden.
 
 ## Recommended approach (if pursued)
 
