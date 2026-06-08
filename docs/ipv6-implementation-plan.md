@@ -1207,7 +1207,7 @@ giving the order preferred-GUA (3) > deprecated-GUA (2) > preferred-ULA (1) > de
 - `livePreferredGlobal(ifkey)` in `src/net_manager.cpp` — backs `/status`, `getIpv6Global()`, and the MQTT announce address.
 - the mDNS slot-swap loop in `onGlobalIPv6Acquired()` — picks the slot promoted into LwIP slot 0 so the (unpatched v4.4) mDNS responder advertises it.
 
-**`/debug/ipv6` endpoint** (`handleDebugIpv6()` in `src/web_server.cpp`, `#if MG_ENABLE_IPV6`): dumps the full per-slot LwIP table (`v6[i] <addr> <STATE> <scope> valid=.. pref=..`) for WiFi STA and ETH via `dumpIpv6Table()`. Same backing function as the GOT_IP6 serial log. Works without auth (empty `www_username`) so it is reachable during a v6-only bring-up before credentials matter. This was the instrument used for all the validation below.
+**`/debug/ipv6` endpoint** (`handleDebugIpv6()` in `src/web_server.cpp`, `#if MG_ENABLE_IPV6`): dumps the full per-slot LwIP table (`v6[i] <addr> <STATE> <scope> valid=.. pref=..`) for WiFi STA and ETH via `dumpIpv6Table()`. Same backing function as the GOT_IP6 serial log. It calls `requestPreProcess()`, so it enforces the **same** auth as every other endpoint: it is open only when no admin password is configured (`www_username` empty) or in AP-only mode — the device's general posture, not a special bypass. That made it reachable during v6-only bring-up before credentials were set; it was the instrument used for all the validation below. (Deployment note: it dumps the full internal address table, so it is listed in the back-out ledger for a keep/gate/drop decision before upstream — see "Security & deployment notes" below.)
 
 **Validation — by parts (each leg proven live), plus the all-up distinct-GUA ordering now closed two ways (host unit test + hardware radvd). Update 2026-06-07.**
 
@@ -1238,6 +1238,31 @@ The lwIP→POD classification boundary is what C2 adds over C1: a real second SL
 **Production risk envelope.** Narrower than "any second GUA" but not a pure test artifact: renumbering is exactly when a new prefix wins slot 0, and there can be a window where the new prefix is advertised but not yet upstream-routable, i.e. the slot-0 winner is transiently unreachable for DNS during the boot-time connect. The earlier real-network-switch renumber (leg 3) worked *because both prefixes were routable*. The watchdog fix removes the severe failure (boot loop, flash wear) regardless of cause; the residual is a bounded degraded window, acceptable for soak and charger flash.
 
 **IPv6-only networks (precise scope):** Inbound HTTP over IPv6-only works after Phase 0-2 (SLAAC + RDNSS DNS + dual-stack listener). Outbound Mongoose connections (MQTT/EmonCMS/OCPP/SNTP/OHM) on IPv6-only networks work after Phase 3b — Mongoose DNS queries AAAA first with A-fallback, and MongooseCore configures IPv6 nameservers from RDNSS. LwIP-level DNS (`WiFi.hostByName()`) also works on IPv6-only after Phase 0. DHCPv6 remains out of scope (v1+).
+
+## Security & deployment notes (IoTaWatt cross-review follow-up, 2026-06-08)
+
+These came out of cross-reviewing the parallel IoTaWatt ESP8266 effort (`~/workspace/IoTaWatt/ai_notes/ipv6_implementation_plan.md`). Where IoTaWatt's conclusion was ESP8266-specific it was re-verified against this ESP-IDF v4.4 build rather than ported.
+
+**Attack surface (verified against the framework sdkconfig, not ported).** Enabling IPv6 exposes NDP/RA/ICMPv6 on-link — the same threat model as IPv4 ARP spoofing, mitigated by the same thing (a trusted L2). The IPv6-fragmentation attack class is the one worth checking, and on this build it is already mostly closed by ESP-IDF defaults:
+- `CONFIG_LWIP_IP6_REASSEMBLY` is **not set** — inbound IPv6 reassembly is OFF (the main fragment-overlap attack class is already disabled, matching IoTaWatt's hardening target by default).
+- `CONFIG_LWIP_IP6_FRAG=y` — outbound fragmentation is on (low risk; it is our stack fragmenting what we send).
+- `CONFIG_LWIP_IPV6_FORWARD` is **not set** — the device never forwards, so it cannot be used as a transit router.
+- `CONFIG_LWIP_IPV6_DHCP6` not set (SLAAC + RDNSS only), ND6 neighbor cache `=5`.
+So no firmware change is needed here; disabling outbound `IP6_FRAG` as well would require a custom lwIP build and is not justified by the residual risk.
+
+**Address privacy (EUI-64).** ESP-IDF SLAAC derives the interface identifier from the MAC (Modified EUI-64) — every address carries the `ff:fe` marker, e.g. MAC `B4:8A:0A:75:C1:04` → `…b68a:0aff:fe75:c104` (confirmed in serial captures). There is no RFC 7217/4941 privacy-address support. Assessed **LOW** for a fixed mains-wired charger: the unit is static infrastructure, the MAC is already on the local segment, and stable addressing is desirable for reaching it. Noted so the choice is explicit rather than silent.
+
+**Global reachability.** On a network with a routable prefix the device's GUA is reachable from off-link. Standard deployment hygiene applies: set an admin password (`www_username`/`www_password`) before exposing the GUA, and do not open inbound firewall holes to it unless intended. Auth is symmetric across IPv4/IPv6 (no subnet-bypass — see GAP 2 above), so there is no IPv6-specific auth gap.
+
+### Back-out / pre-upstream ledger
+
+Dev- and diagnostic-only items to decide on before submitting upstream (kept here so none is forgotten):
+
+| Item | Where | Decision needed |
+|------|-------|-----------------|
+| Temp ArduinoMongoose fork dep (`rnavarro/...#fix/ipv6-dual-stack`) | `platformio.ini` `[common] lib_deps` | Revert to upstream `jeremypoulter/ArduinoMongoose` once the IPv6 dual-stack patches land upstream. |
+| `/debug/ipv6` diagnostic endpoint | `src/web_server.cpp` `handleDebugIpv6()` | Auth-gated like all endpoints, but dumps the internal per-slot table. Keep as-is, gate behind a debug build flag, or drop for release — upstreamer's call. |
+| mDNS slot-0 swap | `src/net_manager.cpp onGlobalIPv6Acquired()` | Workaround for the precompiled v4.4 `libmdns.a`. Superseded by option 2 below (rebuild that reads all slots) if/when that is built; until then the watchdog fix bounds its one downside. |
 
 ## Testing Gaps from IoTaWatt Cross-Review (2026-06-04)
 
@@ -1847,7 +1872,7 @@ Use `esp_netif_get_netif_impl()` to get the raw LwIP `struct netif*` pointer, th
 
 **Status:** Implemented and verified working. `avahi-resolve -6 -n openevse-c104.local` returns the global address.
 
-**Risk:** After the swap, `esp_netif_get_ip6_linklocal()` returns the global address for ALL callers on this interface. The firmware captures addresses from the GOT_IP6 event payload (not these functions), so this is safe. LwIP's internal source address selection (`ip6_select_source_address()`) iterates by type, not slot index.
+**Risk:** After the swap, `esp_netif_get_ip6_linklocal()` returns the global address for ALL callers on this interface. The firmware captures addresses from the GOT_IP6 event payload (not these functions), so that part is safe. **Correction (2026-06-07):** the earlier claim here that `ip6_select_source_address()` "iterates by type, not slot index" and is therefore unaffected was DISPROVEN this session. See "Why a non-routable slot-0 winner stalls the resolve" in the address-reporting section above: LwIP takes the lower slot on ties for destinations that don't prefix-match a candidate, so the swap *does* bias outbound source selection toward whatever sits in slot 0. Benign when the slot-0 winner is routable (the normal case), but it caused a boot-time reboot loop when a non-routable GUA won slot 0. Mitigated by the watchdog fix (`731c0ae`); eliminated at the root by option 2 below (the `libmdns.a` rebuild, which removes the swap entirely). The swap is not purely cosmetic to outbound.
 
 **Code location:** `src/net_manager.cpp`, ETH GOT_IP6 handler, between global address arrival and mDNS restart.
 
