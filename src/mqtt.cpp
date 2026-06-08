@@ -18,6 +18,9 @@
 #include <lwip/netdb.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#ifdef ESP32
+#include <esp_task_wdt.h>   // exempt loopTask around the blocking getaddrinfo() pair
+#endif
 #endif
 
 Mqtt mqtt(evse); // global instance
@@ -276,9 +279,24 @@ void Mqtt::attemptConnection() {
       DEBUG.printf("MQTT: using cached %s -> %s\r\n", mqtt_server.c_str(), _resolvedHost.c_str());
     } else {
       // Cache expired or empty — resolve fresh.
-      // NOTE: getaddrinfo() is synchronous and blocks the event loop.
-      // LwIP default DNS timeout is ~14s with retries, worst case ~28s
-      // for two sequential lookups. The cache mitigates this on reconnects.
+      // NOTE: getaddrinfo() is synchronous and blocks the event loop (this
+      // MicroTask runs in loopTask). LwIP DNS is retry-bounded (~14s per
+      // family, worst case ~28s for the AAAA+A pair) and returns an error
+      // after its budget — it does not hang forever. But ~28s exceeds the
+      // 5s task watchdog, so a cold resolve that stalls (e.g. the slot-0
+      // address can't reach the DNS server) trips the loopTask watchdog and
+      // reboots the device — a boot loop if the stall recurs every cycle.
+      // Observed on hardware when a non-routable GUA won lwIP slot 0 during
+      // boot (RA-injection test, 2026-06-07). Exempt loopTask from the
+      // watchdog across the blocking calls so a stalled resolve fails on its
+      // own bounded budget and the app retries, instead of rebooting. The
+      // cache still mitigates the common reconnect case above.
+#ifdef ESP32
+      bool wdt_was_subscribed = (esp_task_wdt_status(NULL) == ESP_OK);
+      if (wdt_was_subscribed) {
+        esp_task_wdt_delete(NULL);
+      }
+#endif
       bool ipv6_suppressed = (now < _ipv6SuppressedUntil);
       // Snapshot global IPv6 — local copy avoids cross-task String race
       // (net_manager writes on Arduino event task, we read on MicroTasks loop,
@@ -345,6 +363,13 @@ void Mqtt::attemptConnection() {
           _resolvedAt = 0;
         }
       }
+#ifdef ESP32
+      // Re-arm the loopTask watchdog now the blocking resolve is done.
+      if (wdt_was_subscribed) {
+        esp_task_wdt_add(NULL);
+        esp_task_wdt_reset();
+      }
+#endif
     }
   }
 
