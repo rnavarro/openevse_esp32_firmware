@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "event.h"
 #include "mqtt.h"
+#include "divert.h"
 
 #include <algorithm>
 #include <vector>
@@ -218,19 +219,36 @@ unsigned long Scheduler::loop(MicroTasks::WakeReason reason)
   {
     DBUG("New event: ");
 
+    // If leaving an Eco event, deactivate divert eco mode
+    if(_activeEvent.isValid() && EvseState::Eco == _activeEvent.getState()) {
+      DBUGLN("Leaving Eco event, setting divert to Normal");
+      divert.setMode(DivertMode::Normal);
+    }
+
     // We need to change state
     if(currentEvent.isValid())
     {
       DBUGF("Starting %s claim",
         currentEvent.getState().toString());
-      EvseProperties properties(currentEvent.getState());
-      int priority = EvseManager_Priority_Default;
-      if(EvseState::Active == currentEvent.getState())
+
+      if(EvseState::Eco == currentEvent.getState())
       {
-        priority = EvseManager_Priority_Timer;
-        properties.setChargeCurrent(_evse->getMaxHardwareCurrent());
+        // Eco mode: release scheduler claim and let divert take over
+        DBUGLN("Eco event: activating divert eco mode");
+        _evse->release(EvseClient_OpenEVSE_Schedule);
+        divert.setMode(DivertMode::Eco);
       }
-      _evse->claim(EvseClient_OpenEVSE_Schedule, priority, properties);
+      else
+      {
+        EvseProperties properties(currentEvent.getState());
+        int priority = EvseManager_Priority_Default;
+        if(EvseState::Active == currentEvent.getState())
+        {
+          priority = EvseManager_Priority_Timer;
+          properties.setChargeCurrent(_evse->getMaxHardwareCurrent());
+        }
+        _evse->claim(EvseClient_OpenEVSE_Schedule, priority, properties);
+      }
     } else {
       // No scheduled events, release any claims
       DBUGLN("releasing claims");
